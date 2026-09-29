@@ -59,6 +59,18 @@ export async function sendTelegramMessage(
 // === Notifications spécifiques ===
 
 export async function notifyPaymentConfirmed(intent: PaymentIntent) {
+  // Garde de securite : ne jamais notifier pour un intent qui n'est pas en mode 'live'.
+  // Les intents 'test' peuvent etre marques 'paid' via /api/v1/test/sandbox-simulate
+  // ou /api/v1/test/simulate-payment sans qu'aucun paiement reel n'ait lieu ; les notifier
+  // au canal Telegram de production donnerait de fausses confirmations.
+  if (intent.mode !== "live") {
+    console.info("[telegram] notifyPaymentConfirmed skipped (non-live mode)", {
+      ref: intent.ref,
+      mode: intent.mode,
+    });
+    return { ok: true };
+  }
+
   const tierLabel: Record<number, string> = {
     1: "🟢 Tier 1 · Match parfait",
     2: "🟡 Tier 2 · Match probable",

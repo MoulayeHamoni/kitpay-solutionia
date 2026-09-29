@@ -55,7 +55,9 @@ export default async function SuccessPage({ params }: { params: { ref: string } 
   }
 
   let emailJustSent = false;
-  if (!intent.invoice_sent_at) {
+  // Uniquement pour les vrais paiements (mode='live') : les intents 'test' peuvent etre
+  // marques 'paid' via les endpoints simulate sans qu'aucun paiement reel ait eu lieu.
+  if (!intent.invoice_sent_at && intent.mode === "live") {
     notifyPaymentConfirmed(intent).catch((e) =>
       console.error("Telegram notification failed:", e)
     );

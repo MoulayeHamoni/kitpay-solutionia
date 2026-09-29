@@ -41,11 +41,14 @@ async function handle(req: NextRequest) {
 
   const sb = supabaseAdmin();
 
-  // Trouver les paiements payes mais pas finalises
+  // Trouver les paiements payes mais pas finalises.
+  // On filtre sur mode='live' : les intents 'test' peuvent etre marques 'paid'
+  // via les endpoints simulate — les notifier declencherait de faux positifs Telegram/email.
   const { data, error } = await sb
     .from("payment_intents")
     .select("*")
     .eq("status", "paid")
+    .eq("mode", "live")
     .is("invoice_sent_at", null)
     .order("paid_at", { ascending: true })
     .limit(BATCH_LIMIT);

@@ -40,3 +40,23 @@ Out of scope:
   client bundle.
 - Restrict outbound traffic from your Netlify or Vercel account.
 - Enable Supabase MFA and IP allowlists on the project used by KitPay.
+- Any new SQL function that mutates state and is created in the `public`
+  schema must be paired with an explicit
+  `REVOKE EXECUTE ... FROM PUBLIC, anon, authenticated` and, when appropriate,
+  a matching `GRANT EXECUTE ... TO service_role`. Postgres grants `EXECUTE`
+  to `PUBLIC` by default, and Supabase PostgREST exposes every callable
+  public function at `/rest/v1/rpc/<name>` for anyone holding the anon key.
+  See `SECURITY_ADVISORIES.md` entry `KP-SEC-2026-001` for the incident that
+  motivated this rule.
+
+## Acknowledgements
+
+We are grateful to the security researchers who have reported vulnerabilities
+responsibly. Published advisories, including the researchers who reported them,
+are tracked in [`SECURITY_ADVISORIES.md`](./SECURITY_ADVISORIES.md).
+
+Notable contributors:
+
+- [0xMR](https://0xmr.org) (`contact@0xmr.org`) - reported `KP-SEC-2026-001`
+  (unauthenticated payment forgery via public match_payment_* RPC) on
+  2026-09-27 with a complete proof of concept.

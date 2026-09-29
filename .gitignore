@@ -51,3 +51,7 @@ scratch/
 # Agent config
 .claude/
 .cursor/
+
+# Supabase CLI cache
+supabase/.temp/
+supabase/.branches/
