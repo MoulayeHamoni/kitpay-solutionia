@@ -6,6 +6,7 @@ export type PaymentIntent = {
   expected_phone: string;
   method: "Bankily" | "Masrvi" | "Sedad" | "BIM" | "Click" | "BCIPAY";
   status: "pending" | "paid" | "expired" | "cancelled";
+  mode: "test" | "live";
   matched_tier: 1 | 2 | 3 | null;
   actual_sender_phone: string | null;
   sms_received: string | null;
