@@ -60,3 +60,8 @@ Notable contributors:
 - [0xMR](https://0xmr.org) (`contact@0xmr.org`) - reported `KP-SEC-2026-001`
   (unauthenticated payment forgery via public match_payment_* RPC) on
   2026-09-27 with a complete proof of concept.
+- Bechar (`agattbechar@gmail.com`) - reported `KP-SEC-2026-002`
+  (anon-callable `enqueue_webhook_delivery`, `reconcile_orphan`
+  cross-tenant IDOR, `verify_api_key` oracle, orphan RLS policy
+  regression) on 2026-10-24 via static analysis of the public source,
+  with reproduction steps and recommended fixes.
