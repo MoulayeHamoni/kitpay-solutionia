@@ -570,7 +570,6 @@ AS $$
 DECLARE
   v_count integer := 0;
   v_webhook webhooks%ROWTYPE;
-  v_delivery_id uuid;
   v_event_mode text;
 BEGIN
   v_event_mode := CASE WHEN p_payload->>'livemode' = 'true' THEN 'live' ELSE 'test' END;
@@ -582,9 +581,12 @@ BEGIN
       AND p_event_type = ANY(w.events)
       AND (w.mode = v_event_mode OR w.mode = 'both')
   LOOP
-    v_delivery_id := gen_random_uuid();
-    INSERT INTO webhook_deliveries (id, webhook_id, event_type, payload, created_at)
-    VALUES (v_delivery_id, v_webhook.id, p_event_type, p_payload, now());
+    INSERT INTO public.webhook_deliveries (
+      webhook_id, merchant_id, event_type, payload, status, next_retry_at
+    )
+    VALUES (
+      v_webhook.id, p_merchant_id, p_event_type, p_payload, 'pending', now()
+    );
     v_count := v_count + 1;
   END LOOP;
 
