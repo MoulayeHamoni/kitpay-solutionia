@@ -37,12 +37,19 @@ export default async function WebhooksPage() {
             >
               <div className="flex items-start justify-between gap-4">
                 <div className="min-w-0 flex-1">
-                  <Link
-                    href={`/dashboard/webhooks/${w.id}`}
-                    className="block truncate font-mono text-sm text-[var(--ink)] hover:text-[var(--bronze)] transition-colors duration-200"
-                  >
-                    {w.url}
-                  </Link>
+                  <div className="flex items-center gap-2 min-w-0">
+                    <Link
+                      href={`/dashboard/webhooks/${w.id}`}
+                      className="block truncate font-mono text-sm text-[var(--ink)] hover:text-[var(--bronze)] transition-colors duration-200"
+                    >
+                      {w.url}
+                    </Link>
+                    {w.mode && (
+                      <span className="shrink-0 inline-block text-[10px] uppercase tracking-wider px-1.5 py-0.5 border border-[var(--stone-300)] text-[var(--stone-600)] rounded-sm">
+                        {w.mode}
+                      </span>
+                    )}
+                  </div>
                   {w.events && w.events.length > 0 && (
                     <div className="mt-2 flex flex-wrap gap-1.5">
                       {(w.events as string[]).map((e) => (

@@ -15,6 +15,7 @@ export function AddWebhookButton() {
   const [showSecret, setShowSecret] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [form, setForm] = useState<{ url: string; events: string[] }>({ url: '', events: [...ALL_EVENTS] });
+  const [mode, setMode] = useState<'test' | 'live' | 'both'>('live');
 
   function toggleEvent(ev: string) {
     setForm(f => ({
@@ -26,7 +27,7 @@ export function AddWebhookButton() {
   function submit() {
     setErr(null);
     startTransition(async () => {
-      const res = await addWebhook(form);
+      const res = await addWebhook({ ...form, mode });
       if (!res.ok) setErr(res.error ?? null);
       else if (res.secret) setShowSecret(res.secret);
     });
@@ -37,6 +38,7 @@ export function AddWebhookButton() {
     setOpen(false);
     setShowSecret(null);
     setForm({ url: '', events: [...ALL_EVENTS] });
+    setMode('live');
     setErr(null);
     // Only refresh the list once the user is done with the secret modal
     if (wasShowingSecret) router.refresh();
@@ -77,6 +79,20 @@ export function AddWebhookButton() {
                   </label>
                 ))}
               </div>
+            </div>
+            <div>
+              <label className="block text-xs mt-4 mb-1 uppercase tracking-wider text-[var(--stone-500)]">
+                Scope
+              </label>
+              <select
+                value={mode}
+                onChange={(e) => setMode(e.target.value as 'test' | 'live' | 'both')}
+                className="w-full border border-[var(--stone-300)] px-3 py-2 rounded-sm text-sm"
+              >
+                <option value="live">Live uniquement (defaut)</option>
+                <option value="test">Test uniquement</option>
+                <option value="both">Les deux (test + live)</option>
+              </select>
             </div>
             {err && <p className="text-sm text-red-600">{err}</p>}
             <button onClick={submit} disabled={pending} className="w-full rounded-md bg-neutral-900 px-4 py-2 text-white disabled:opacity-50">

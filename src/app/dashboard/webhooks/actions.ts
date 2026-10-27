@@ -7,11 +7,14 @@ import { createSupabaseAdminClient } from '@/lib/supabase/server';
 
 const MAX_WEBHOOKS = 5;
 
-export async function addWebhook(args: { url: string; events: string[] }): Promise<{ ok: boolean; secret?: string; error?: string }> {
+export async function addWebhook(args: { url: string; events: string[]; mode: 'test' | 'live' | 'both' }): Promise<{ ok: boolean; secret?: string; error?: string }> {
   const { merchant } = await requireMerchant();
   const cleanUrl = (args.url ?? '').trim();
   if (!cleanUrl.match(/^https?:\/\//)) {
     return { ok: false, error: `URL must start with http(s):// — got: "${cleanUrl}" (length ${cleanUrl.length})` };
+  }
+  if (!['test', 'live', 'both'].includes(args.mode)) {
+    return { ok: false, error: 'Scope invalide' };
   }
   const admin = createSupabaseAdminClient();
   const { count } = await admin.from('webhooks').select('*', { count: 'exact', head: true })
@@ -24,6 +27,7 @@ export async function addWebhook(args: { url: string; events: string[] }): Promi
     secret,
     events: args.events.length > 0 ? args.events : ['payment.succeeded', 'payment.expired', 'payment.cancelled'],
     enabled: true,
+    mode: args.mode,
   });
   if (error) return { ok: false, error: error.message };
   // NOTE: do NOT revalidatePath here — it would remount AddWebhookButton
