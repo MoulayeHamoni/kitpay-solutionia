@@ -49,7 +49,7 @@ The attack does not require any account or prior knowledge of the KitPay codebas
 
 In the current single-operator production deployment, the secret is only on one device. That bounds reachability today but does not make the design acceptable: the threat model must account for device compromise, multi-operator growth, or accidental secret disclosure during onboarding.
 
-The `WEBHOOK_SECRET` variable is not retired by this fix; it remains in the environment until the operator completes MacroDroid rotation to a per-device Bearer token (Phase F of the v42 rollout plan). The legacy validation path is kept alive for exactly one deploy cycle and will be removed in v43.
+The `WEBHOOK_SECRET` variable is not retired by this fix; it remains in `.env.example` until Phase F operator rotation is confirmed (v43). The ingest route itself no longer accepts it: `/api/sms-ingest` hard-rejects any request that does not carry a valid `Authorization: Bearer kpf_<token>` header, so the rotation window is operationally offline for SMS forwarding until the MacroDroid action is updated.
 
 **F2 - Platform-wide Tier-1 matching allows cross-merchant intent absorption (High)**
 
@@ -111,14 +111,14 @@ Migration [`supabase/v40_ingest_hardening.sql`](./supabase/v40_ingest_hardening.
 
 **Per-device forwarder credential table**
 
-- Creates `forwarder_devices` table: `id uuid PK`, `merchant_id uuid FK merchants`, `name text`, `token_hash text NOT NULL` (sha256 of the `kpf_*` Bearer token), `enabled boolean DEFAULT true`, `created_at timestamptz DEFAULT now()`.
+- Creates `forwarder_devices` table: `id uuid PK`, `merchant_id uuid FK merchants`, `label text NOT NULL`, `token_hash text NOT NULL` (sha256 of the `kpf_*` Bearer token), `enabled boolean DEFAULT true`, `created_at timestamptz DEFAULT now()`.
 - `REVOKE ALL ON forwarder_devices FROM PUBLIC, anon, authenticated`. Service role only.
 - RLS disabled on this table (service_role access path only; no client-side access needed).
 
 **`verify_forwarder_token(p_token text)` RPC**
 
 - `SECURITY DEFINER`, `SET search_path = public, extensions, pg_temp`.
-- Computes `sha256(p_token::bytea)::text`, looks up in `forwarder_devices WHERE token_hash = <hash> AND enabled = true`, returns `(merchant_id uuid, device_id uuid)` or raises `SQLSTATE P0002` if not found.
+- Computes `sha256(p_token::bytea)::text`, looks up in `forwarder_devices WHERE token_hash = <hash> AND enabled = true`, returns `(merchant_id uuid, device_id uuid)`. The function uses `RETURN QUERY ... LIMIT 1`, which returns an empty result set when no row matches; no exception is raised. The Next.js caller checks `Array.isArray(authData) && authData.length === 0` and returns 401.
 - `REVOKE EXECUTE FROM PUBLIC, anon, authenticated; GRANT EXECUTE TO service_role`.
 - Called by the updated `/api/sms-ingest` handler; result is used to populate `p_merchant_id` on all downstream matcher calls.
 
@@ -135,7 +135,7 @@ Migration [`supabase/v40_ingest_hardening.sql`](./supabase/v40_ingest_hardening.
 
 - `ALTER TABLE webhooks ADD COLUMN mode text NOT NULL DEFAULT 'live' CHECK (mode IN ('test', 'live', 'both'))`.
 - `UPDATE webhooks SET mode = 'live'` backfill for existing rows.
-- `enqueue_webhook_delivery` updated: adds `p_intent_mode text` parameter, filters `WHERE (mode = p_intent_mode OR mode = 'both')` before inserting `webhook_deliveries` rows.
+- `enqueue_webhook_delivery` signature remains `(p_merchant_id uuid, p_event_type text, p_payload jsonb)` unchanged. Inside the function, it computes `v_event_mode := CASE WHEN p_payload->>'livemode' = 'true' THEN 'live' ELSE 'test' END` and filters `WHERE ... AND (w.mode = v_event_mode OR w.mode = 'both')` before inserting `webhook_deliveries` rows. No new parameter is added to the function.
 - `NOTIFY pgrst, 'reload schema'` at end of migration.
 
 **Code changes (both repos unless noted)**
@@ -144,32 +144,30 @@ Migration [`supabase/v40_ingest_hardening.sql`](./supabase/v40_ingest_hardening.
   - Replaces header-based `WEBHOOK_SECRET` validation with `await supabaseAdmin.rpc('verify_forwarder_token', { p_token: bearerToken })`.
   - Destructures `merchant_id` and `device_id` from the RPC result.
   - Passes `merchant_id` as the fourth argument to all six matcher calls.
-  - Temporary compatibility shim: if the new Bearer check fails and the `WEBHOOK_SECRET` header is present and matches, the legacy path fires without `merchant_id` (3-arg matchers) and logs a deprecation warning. This shim will be removed in v43 after Phase F operator rotation is confirmed.
+  - The ingest cutover is hard, not rolling: after the migration lands, `/api/sms-ingest` returns 401 for every request that does not carry a valid `Authorization: Bearer kpf_<token>` header. During the brief window between the Netlify deploy and the operator rotating their MacroDroid HTTP action, inbound SMS will fail with 401 and matching will not fire; this is operationally acceptable because the operator is the one triggering the rotation and the window is seconds-to-minutes. The 3-arg legacy matcher overloads remain in the database for one deploy cycle (dropped in v43) so that any late in-flight call via the service_role still succeeds; no code path in the OSS tree uses them after v40.
 - `src/lib/format.ts` `generateRef()`:
   - Replaces `Math.random()` loop with `randomBytes(8)` from `node:crypto`, encodes to 10 uppercase alphanumeric characters.
   - Vitest test added in `src/lib/__tests__/format.test.ts`: asserts length 10, charset `[A-Z0-9]`, and non-collision across 1000 calls.
 - `src/app/dashboard/forwarders/page.tsx` + `actions.ts` (new route):
   - Lists enrolled forwarder devices for the authenticated merchant.
-  - Allows creating a new device (generates `kpf_` + `randomBytes(24).toString('hex')` token, stores sha256 hash, returns the raw token once for the operator to copy into MacroDroid).
+  - Allows creating a new device (generates `'kpf_' + randomBytes(16).toString('base64url')` token (16 bytes, base64url encoding, ~26 characters total including the prefix), stores sha256 hash, returns the raw token once for the operator to copy into MacroDroid).
   - Allows revoking a device (sets `enabled = false`).
 - `src/app/dashboard/webhooks/` subscription form:
   - Adds mode selector (`Test only / Live only / Both`) mapped to `mode` column.
   - Defaults to `Live only` for new subscriptions.
-- OSS only - `src/app/api/cron/deliver-webhooks/route.ts`:
-  - Passes `intent.mode` as `p_intent_mode` to any future `enqueue_webhook_delivery` calls triggered from this worker path.
+- OSS only - `src/app/api/cron/deliver-webhooks/route.ts`: unchanged by this PR. The delivery worker does not call `enqueue_webhook_delivery`; it reads already-enqueued rows from `webhook_deliveries` and dispatches them. No changes were needed here because the mode filtering happens at enqueue time inside the function itself.
 
 **Deferred to v43**
 
 - Drop the 3-arg overloads of all six per-method matchers once Phase F operator rotation is confirmed and no 3-arg calls remain in either repo.
-- Remove `WEBHOOK_SECRET` from `.env.example` and hard-delete the compatibility shim in `/api/sms-ingest`.
-- Add `/dashboard/forwarders` link to main dashboard nav.
+- Remove `WEBHOOK_SECRET` from `.env.example`.
 
 ### Timeline
 
 - **2026-10-27, morning (Nouakchott)** - Third report received at `contact@solutionia.work`. Covers F1 (shared `WEBHOOK_SECRET`) and F2 (platform-wide Tier-1 matching) which had been deferred from the KP-SEC-2026-002 "Still tracked" section, plus Medium (generateRef CSPRNG) and Low (test-mode webhook mixing) also deferred from KP-SEC-2026-002 and KP-SEC-2026-003 footnotes. Each finding verified against both source trees and the live Supabase project.
 - **2026-10-27, same day** - Migration `v42_ingest_hardening.sql` (private) / `v40_ingest_hardening.sql` (OSS) written and applied to the shared Supabase project `rpgmzookqozeijtexmgl`. Code patches shipped in both repos across the new `/api/sms-ingest` Bearer auth, `/dashboard/forwarders`, `webhooks.mode` scope selector, and `generateRef` CSPRNG. Verification blocks passed. PostgREST reloaded. Public disclosure through this advisory.
-- **Phase F (pending)** - Operator (Moulaye) rotates the MacroDroid HTTP header on his forwarding phone from the shared `WEBHOOK_SECRET` value to the per-device `kpf_*` Bearer token generated in `/dashboard/forwarders`. Until this rotation is complete the legacy compatibility shim remains active.
-- **v43 follow-up (scheduled)** - Drop 3-arg matcher overloads, retire `WEBHOOK_SECRET` env var, remove compatibility shim.
+- **Phase F (pending)** - Operator (Moulaye) rotates the MacroDroid HTTP header on his forwarding phone from the shared `WEBHOOK_SECRET` value to the per-device `kpf_*` Bearer token generated in `/dashboard/forwarders`. From the moment the Netlify deploy lands, `/api/sms-ingest` already hard-rejects any request without a valid Bearer token; SMS forwarding is offline until the MacroDroid action is updated, which is expected to take seconds to minutes.
+- **v43 follow-up (scheduled)** - Drop 3-arg matcher overloads, retire `WEBHOOK_SECRET` env var.
 
 ### Credit
 
