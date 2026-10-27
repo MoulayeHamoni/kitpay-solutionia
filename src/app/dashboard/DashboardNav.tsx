@@ -7,11 +7,12 @@ const NAV = [
   { href: '/dashboard', label: "Vue d'ensemble", num: '01' },
   { href: '/dashboard/intents', label: 'Paiements', num: '02' },
   { href: '/dashboard/operators', label: 'Opérateurs', num: '03' },
-  { href: '/dashboard/api-keys', label: 'Clés API', num: '04' },
-  { href: '/dashboard/webhooks', label: 'Webhooks', num: '05' },
-  { href: '/dashboard/developers', label: 'Développeurs', num: '06' },
-  { href: '/dashboard/reconciliation', label: 'Réconciliation', num: '07' },
-  { href: '/dashboard/settings', label: 'Paramètres', num: '08' },
+  { href: '/dashboard/forwarders', label: 'Forwarders', num: '04' },
+  { href: '/dashboard/api-keys', label: 'Clés API', num: '05' },
+  { href: '/dashboard/webhooks', label: 'Webhooks', num: '06' },
+  { href: '/dashboard/developers', label: 'Développeurs', num: '07' },
+  { href: '/dashboard/reconciliation', label: 'Réconciliation', num: '08' },
+  { href: '/dashboard/settings', label: 'Paramètres', num: '09' },
 ];
 
 export function DashboardNav() {
