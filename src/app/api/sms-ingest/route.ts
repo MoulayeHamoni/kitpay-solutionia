@@ -85,18 +85,29 @@ function parseSms(from: string, rawSms: string): ParseResult {
 }
 
 export async function POST(req: NextRequest) {
-  const secret = req.headers.get("x-webhook-secret");
-  if (!process.env.WEBHOOK_SECRET || secret !== process.env.WEBHOOK_SECRET) {
+  // --- 1. Auth : Bearer kpf_... -> device + merchant ---
+  const auth = req.headers.get("authorization") ?? "";
+  const m = auth.match(/^Bearer\s+(kpf_[A-Za-z0-9_-]{20,})$/);
+  if (!m) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
+  const sb = supabaseAdmin();
+  const { data: authData, error: authErr } = await sb.rpc("verify_forwarder_token", {
+    p_token: m[1],
+  });
+  if (authErr || !authData || (Array.isArray(authData) && authData.length === 0)) {
+    return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+  }
+  const authRow = Array.isArray(authData) ? authData[0] : authData;
+  const callerMerchantId: string = (authRow as { merchant_id: string }).merchant_id;
 
+  // --- 2. Body ---
   const url = new URL(req.url);
   const querySms = url.searchParams.get("sms_body") ?? "";
   const queryFrom = url.searchParams.get("from") ?? "";
 
   let rawSms = "";
   let from = "";
-
   try {
     const body = await req.json();
     from = String(body.from ?? "").trim() || queryFrom;
@@ -110,15 +121,14 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "SMS body manquant" }, { status: 400 });
   }
 
+  // --- 3. Parse ---
   const parsed = parseSms(from, rawSms);
   if (!parsed) {
     console.warn("[sms-ingest] parse_failed", { from, sms: rawSms.slice(0, 100) });
     return NextResponse.json({ ok: false, matched: false, error: "parse_failed", from, sms: rawSms.slice(0, 100) });
   }
 
-  const sb = supabaseAdmin();
-
-  // Fonctions dédiées par méthode — elles appellent enqueue_webhook_delivery
+  // --- 4. Dispatch ---
   const METHOD_FN: Record<string, string> = {
     Bankily: "match_payment_bankily",
     Masrvi:  "match_payment_masrvi",
@@ -133,10 +143,25 @@ export async function POST(req: NextRequest) {
     p_sender_phone: parsed.senderPhone,
     p_raw_sms: rawSms.slice(0, 1000),
   };
-  if (fnName === "match_payment") rpcParams.p_method = parsed.method;
-  const rpcCall = sb.rpc(fnName as any, rpcParams);
 
-  const { data, error } = await rpcCall;
+  if (fnName === "match_payment") {
+    // v3 fallback : resolve this merchant's receiver phone for the method
+    const { data: op } = await sb.from("merchant_operators")
+      .select("expected_phone")
+      .eq("merchant_id", callerMerchantId)
+      .eq("method", parsed.method)
+      .eq("enabled", true)
+      .maybeSingle();
+    if (!op) {
+      return NextResponse.json({ ok: false, matched: false, reason: "method_not_enabled_for_merchant" });
+    }
+    rpcParams.p_method = parsed.method;
+    rpcParams.p_merchant_phone = (op as { expected_phone: string }).expected_phone;
+  } else {
+    rpcParams.p_merchant_id = callerMerchantId;
+  }
+
+  const { data, error } = await sb.rpc(fnName as any, rpcParams);
 
   if (error) {
     console.error("[sms-ingest] match_payment error", error);
