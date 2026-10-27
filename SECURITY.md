@@ -64,4 +64,10 @@ Notable contributors:
   (anon-callable `enqueue_webhook_delivery`, `reconcile_orphan`
   cross-tenant IDOR, `verify_api_key` oracle, orphan RLS policy
   regression) on 2026-10-24 via static analysis of the public source,
-  with reproduction steps and recommended fixes.
+  with reproduction steps and recommended fixes; reported `KP-SEC-2026-003`
+  (merchant table over-exposed to anon/authenticated roles, test API key
+  reaching live intents, orphan merchant attribution regression) and
+  `KP-SEC-2026-004` (shared `WEBHOOK_SECRET` synthetic-SMS forgery,
+  platform-wide Tier-1 cross-merchant intent absorption, weak `generateRef`
+  entropy, test-mode webhook mixing) on 2026-10-27 via static review of
+  the public source and verification of the deployed infrastructure.

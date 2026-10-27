@@ -24,6 +24,159 @@ Each advisory contains:
 
 ---
 
+## KP-SEC-2026-004 - Shared ingest credential enables synthetic-SMS forgery, platform-wide Tier-1 matching allows cross-merchant intent absorption, weak ref entropy, test-mode webhook mixing
+
+- **Severity** : Critical (shared `WEBHOOK_SECRET` for `/api/sms-ingest`) + High (platform-wide Tier-1 matching across all six per-method matchers) + Medium (`generateRef()` using `Math.random()` ~31-bit entropy) + Low (test-mode webhook events delivered to live subscriptions)
+- **Status** : Fixed in v40 (OSS) / v42 (private). Pending Phase F operator rotation of MacroDroid header before legacy credential retirement in v43.
+- **Reported** : 2026-10-27
+- **Fixed** : 2026-10-27 (same day)
+- **Reporter** : Bechar (`agattbechar@gmail.com`)
+- **Summary** : A third review, this time focused on the SMS ingest pipeline and the merchant-scoping of the matching layer, surfaced four issues deferred from the KP-SEC-2026-002 and KP-SEC-2026-003 advisory cycles. The most severe finding is that `/api/sms-ingest` authenticated all callers with a single shared environment variable (`WEBHOOK_SECRET`), meaning any party who obtained the secret from any device config could submit a crafted SMS body and cause the matcher pipeline to mark a live pending intent as paid, triggering a legitimately-signed `payment.succeeded` webhook. The second critical finding is that all six per-method Postgres functions (`match_payment_bankily`, `_masrvi`, `_bim`, `_sedad`, `_click`, `_bcipay`) ran their Tier-1 lookup across every merchant's intents; a matching (method, amount, phone) triple from any merchant's live, pending, unexpired set would absorb an incoming confirmation regardless of which merchant's ingest endpoint received the SMS. These two findings are resolved by replacing `WEBHOOK_SECRET` with per-device Bearer tokens (`kpf_*`) stored as sha256 hashes and resolved via the new `verify_forwarder_token` RPC, and by adding a mandatory `p_merchant_id` fourth argument to all six matchers that scopes Tier-1, Tier-2 count, and orphan attribution to the receiving merchant. Two lower-severity issues are also resolved: `generateRef()` in `src/lib/format.ts` is migrated from `Math.random()` (~31 bits) to `randomBytes(8)` CSPRNG (~57 bits), and a new `webhooks.mode` enum column (`'test' | 'live' | 'both'`, default `'live'`) ensures that test-mode events are never delivered to live subscriptions. All four fixes ship in migration `supabase/v40_ingest_hardening.sql` (OSS) / `v42_ingest_hardening.sql` (private), applied to the shared Supabase project `rpgmzookqozeijtexmgl` on 2026-10-27.
+
+### Details
+
+**F1 - Shared `WEBHOOK_SECRET` allows synthetic SMS forgery (Critical)**
+
+`src/app/api/sms-ingest/route.ts` accepted any HTTP POST carrying the value of the `WEBHOOK_SECRET` environment variable in its authorization header. This secret was a single platform-wide string. `docs/android-setup.md` instructed every operator to paste the same value into MacroDroid's HTTP action configuration on their forwarding phone.
+
+The attack surface:
+
+1. The shared secret is operationally distributed to human-configured Android automations. Any path by which the secret leaks from a device config (screen capture, config export, adb backup, physical access to any enrolled phone, an over-broad share from the operator to a third party during setup) immediately grants the holder the ability to inject arbitrary SMS content into the platform.
+2. Nothing in the request body is bound to a specific merchant, a specific device, or a specific operator. Once authenticated, the submitted `sender`, `body`, and `receiver` are fed directly into the matcher pipeline with full `service_role` trust.
+3. The matcher pipeline runs all six per-method functions (see F2 below) with no additional authorization check. A correctly crafted body that passes `parseSMS()` and hits a live, pending, unexpired intent will flip that intent to `status='paid'`, enqueue a `payment.succeeded` webhook signed with the merchant's webhook secret, send a receipt email, and update merchant dashboards, all indistinguishable from a real payment.
+
+The attack does not require any account or prior knowledge of the KitPay codebase beyond inspecting the public OSS source. The SMS body format is documented in `docs/android-setup.md` and in the per-method parser functions under `src/lib/sms/`. Given a known (method, amount, phone) triple from any public checkout session, an attacker holding the secret can produce a fraudulent `payment.succeeded` event with no money changing hands.
+
+In the current single-operator production deployment, the secret is only on one device. That bounds reachability today but does not make the design acceptable: the threat model must account for device compromise, multi-operator growth, or accidental secret disclosure during onboarding.
+
+The `WEBHOOK_SECRET` variable is not retired by this fix; it remains in the environment until the operator completes MacroDroid rotation to a per-device Bearer token (Phase F of the v42 rollout plan). The legacy validation path is kept alive for exactly one deploy cycle and will be removed in v43.
+
+**F2 - Platform-wide Tier-1 matching allows cross-merchant intent absorption (High)**
+
+The six per-method matcher functions produced by migrations v26 through v36 (`match_payment_bankily`, `match_payment_masrvi`, `match_payment_bim`, `match_payment_sedad`, `match_payment_click`, `match_payment_bcipay`) each implement a three-tier resolution strategy. Tier 1 queries `payment_intents` for a row matching the full triple:
+
+```sql
+WHERE method = '<method>'
+  AND amount = p_amount
+  AND expected_phone = p_sender_phone
+  AND status = 'pending'
+  AND mode = 'live'
+  AND expires_at > now()
+```
+
+This lookup is not restricted to any merchant. All six matchers were designed when KitPay had one merchant, and the merchant-scoping requirement was never added as the multi-merchant architecture evolved.
+
+Consequence: if two merchants share the same payment method and both have a live, pending, unexpired intent for the same amount from the same phone number, the matcher selects whichever row sorts first (effectively the older intent). The receiving merchant - the one whose `/api/sms-ingest` endpoint received the forwarded SMS - may receive a confirmation for an intent that belongs to the other merchant. The other merchant's intent is marked paid, their webhook is fired, and the receiving merchant's intent remains pending.
+
+The same cross-merchant absorption can occur at Tier 2 (amount-only fallback when exactly one unmatched intent exists for the method) if the count query spans all merchants. A multi-merchant deployment where merchants coincidentally issue intents of the same denomination creates an ambiguous Tier-2 pool even when no shared phone is involved.
+
+Tier-3 (manual reconciliation) and the new Tier-4 guard from v40 (blocking orphans with `merchant_id IS NULL`) do not compensate for the upstream scoping gap, because by the time a Tier-1 or Tier-2 match fires the wrong merchant has already been credited.
+
+The Tier-1 and Tier-2 queries must be scoped by the merchant identity derived from the ingest credential, which is exactly what the new per-device Bearer token system (F1 fix) provides. The fix adds `p_merchant_id uuid` as a mandatory fourth argument to all six matchers and threads it into every tier lookup, the Tier-2 count filter, and the orphan `INSERT`.
+
+**Medium - `generateRef()` uses `Math.random()` (~31-bit entropy)**
+
+`src/lib/format.ts` `generateRef()` generated `/pay/<ref>` and `/success/<ref>` URL identifiers using `Math.random()` seeded by the V8 runtime. `Math.random()` is not a CSPRNG; its internal state is approximately 128 bits but the observable output per call is ~52 bits, and because the string was constructed from a small charset with fixed length the practical entropy was approximately 31 bits (roughly 2 billion distinct refs).
+
+`/pay/<ref>` is the publicly visible checkout URL that KitPay embeds in QR codes and SMS links sent to customers. An attacker who monitors a stream of these URLs (for example, a social-engineering or phishing scenario where a victim shares the link) and can estimate the generation time could enumerate nearby refs in a feasible brute-force window. A guessed pending ref combined with knowledge of the expected phone and method could feed the F2 cross-merchant attack or the now-patched KP-SEC-2026-002 Finding 1 (forged `enqueue_webhook_delivery`).
+
+The fix replaces `Math.random()` with `randomBytes(8)` from the Node.js `crypto` module, encoded as 10 uppercase alphanumeric characters. This yields approximately 57 bits of CSPRNG entropy. A vitest unit test asserts the 10-character uppercase alphanumeric contract and that two successive calls do not collide.
+
+**Low - Test-mode webhook events delivered to live subscriptions**
+
+Before this fix, `enqueue_webhook_delivery` inserted a `webhook_deliveries` row for every enabled subscription regardless of whether the subscription was created to receive test events, live events, or both. A merchant running integration tests against the test-mode endpoint would therefore deliver events with `livemode: false` to their production webhook endpoint.
+
+This created two classes of problem:
+
+- Merchants whose fulfilment logic branches on the `livemode` flag could receive spurious `payment.succeeded(livemode: false)` calls on their production handler, polluting order counts, audit trails, or triggering automated responses.
+- Merchants who do not branch on `livemode` (which is the more common case) could process test-mode events as real payments, depending on their integration.
+
+The fix adds a `mode` enum column (`'test' | 'live' | 'both'`) to the `webhooks` table, defaulting to `'live'`. `enqueue_webhook_delivery` is updated to filter `webhooks.mode` against the intent's `mode`: a subscription with `mode = 'live'` only receives live events; `mode = 'test'` only receives test events; `mode = 'both'` preserves the previous behavior. The dashboard webhook configuration UI exposes a mode selector (`/dashboard/webhooks` subscription form). Existing subscriptions are backfilled to `mode = 'live'` in the migration, preserving prior behavior for production endpoints.
+
+### Impact
+
+- **Critical (F1)**: Any party holding `WEBHOOK_SECRET` - obtained from a device config, shared during onboarding, extracted from a backup, or leaked through any other operational path - could mark any live pending intent on the platform as paid without transferring any money. Merchants would receive a correctly-signed `payment.succeeded` webhook indistinguishable from a genuine payment. For merchants that fulfil automatically on webhook receipt (digital goods, service activations, credit top-ups) this is equivalent to unlimited free orders. The attack does not require a KitPay account, any prior interaction with the platform, or any interaction with the Supabase layer.
+
+- **High (F2)**: In a multi-merchant deployment where two merchants both accept the same method and both have live pending intents of the same denomination from the same phone number (a realistic scenario in any geographic market with a small pool of frequent payers), the platform's matching logic will credit the wrong merchant. The wrongly-credited merchant receives a legitimate-looking payment confirmation; the correctly-paying merchant's intent stays pending and times out. The attacker does not need to be a registered merchant; the condition arises from normal concurrent usage. In the worst case the mismatch enables a registered merchant to deliberately craft a colliding intent to absorb a competitor's payment flow.
+
+- **Medium (generateRef)**: Refs generated before this fix have ~31 bits of entropy. Brute-forcing a specific ref requires on average 1 billion guesses, which is non-trivial but not out of reach for a motivated attacker with high-bandwidth access to the `/pay/<ref>` endpoint. The practical risk is low because a guessed ref must still satisfy F1/F2 prerequisites to cause financial harm; the fix eliminates the entropy gap as a prerequisite for future attack chains.
+
+- **Low (test-mode webhooks)**: Merchants running integration tests against the KitPay test-mode endpoint may inadvertently trigger production fulfilment logic if their endpoint does not guard on `livemode`. No cross-merchant leak is involved; the impact is bounded to the merchant's own integration.
+
+No financial loss and no exposure of customer data beyond the merchant's own records is known to have occurred between report and fix.
+
+### Fix
+
+Migration [`supabase/v40_ingest_hardening.sql`](./supabase/v40_ingest_hardening.sql) (private deployment repo mirrors it as `v42_ingest_hardening.sql`), applied to shared Supabase project `rpgmzookqozeijtexmgl` on 2026-10-27:
+
+**Per-device forwarder credential table**
+
+- Creates `forwarder_devices` table: `id uuid PK`, `merchant_id uuid FK merchants`, `name text`, `token_hash text NOT NULL` (sha256 of the `kpf_*` Bearer token), `enabled boolean DEFAULT true`, `created_at timestamptz DEFAULT now()`.
+- `REVOKE ALL ON forwarder_devices FROM PUBLIC, anon, authenticated`. Service role only.
+- RLS disabled on this table (service_role access path only; no client-side access needed).
+
+**`verify_forwarder_token(p_token text)` RPC**
+
+- `SECURITY DEFINER`, `SET search_path = public, extensions, pg_temp`.
+- Computes `sha256(p_token::bytea)::text`, looks up in `forwarder_devices WHERE token_hash = <hash> AND enabled = true`, returns `(merchant_id uuid, device_id uuid)` or raises `SQLSTATE P0002` if not found.
+- `REVOKE EXECUTE FROM PUBLIC, anon, authenticated; GRANT EXECUTE TO service_role`.
+- Called by the updated `/api/sms-ingest` handler; result is used to populate `p_merchant_id` on all downstream matcher calls.
+
+**Six per-method matchers updated**
+
+- New overload of each of `match_payment_bankily`, `match_payment_masrvi`, `match_payment_bim`, `match_payment_sedad`, `match_payment_click`, `match_payment_bcipay`: adds `p_merchant_id uuid` as a fourth argument.
+- Tier-1 lookup adds `AND merchant_id = p_merchant_id`.
+- Tier-2 count query adds `AND merchant_id = p_merchant_id`.
+- Orphan `INSERT` includes `merchant_id = p_merchant_id` (removing the `NULL` default that caused the regression tracked in KP-SEC-2026-003 F3, now fully closed for the per-device path).
+- Three-argument overloads are kept (`p_merchant_id` omitted or `NULL`) for one deploy cycle to allow a safe rolling upgrade. These overloads will be dropped in the v43 follow-up migration once all callers have migrated.
+- `REVOKE`/`GRANT` block regenerated for all twelve function signatures (3-arg and 4-arg for each of the six methods).
+
+**`webhooks.mode` column**
+
+- `ALTER TABLE webhooks ADD COLUMN mode text NOT NULL DEFAULT 'live' CHECK (mode IN ('test', 'live', 'both'))`.
+- `UPDATE webhooks SET mode = 'live'` backfill for existing rows.
+- `enqueue_webhook_delivery` updated: adds `p_intent_mode text` parameter, filters `WHERE (mode = p_intent_mode OR mode = 'both')` before inserting `webhook_deliveries` rows.
+- `NOTIFY pgrst, 'reload schema'` at end of migration.
+
+**Code changes (both repos unless noted)**
+
+- `src/app/api/sms-ingest/route.ts`:
+  - Replaces header-based `WEBHOOK_SECRET` validation with `await supabaseAdmin.rpc('verify_forwarder_token', { p_token: bearerToken })`.
+  - Destructures `merchant_id` and `device_id` from the RPC result.
+  - Passes `merchant_id` as the fourth argument to all six matcher calls.
+  - Temporary compatibility shim: if the new Bearer check fails and the `WEBHOOK_SECRET` header is present and matches, the legacy path fires without `merchant_id` (3-arg matchers) and logs a deprecation warning. This shim will be removed in v43 after Phase F operator rotation is confirmed.
+- `src/lib/format.ts` `generateRef()`:
+  - Replaces `Math.random()` loop with `randomBytes(8)` from `node:crypto`, encodes to 10 uppercase alphanumeric characters.
+  - Vitest test added in `src/lib/__tests__/format.test.ts`: asserts length 10, charset `[A-Z0-9]`, and non-collision across 1000 calls.
+- `src/app/dashboard/forwarders/page.tsx` + `actions.ts` (new route):
+  - Lists enrolled forwarder devices for the authenticated merchant.
+  - Allows creating a new device (generates `kpf_` + `randomBytes(24).toString('hex')` token, stores sha256 hash, returns the raw token once for the operator to copy into MacroDroid).
+  - Allows revoking a device (sets `enabled = false`).
+- `src/app/dashboard/webhooks/` subscription form:
+  - Adds mode selector (`Test only / Live only / Both`) mapped to `mode` column.
+  - Defaults to `Live only` for new subscriptions.
+- OSS only - `src/app/api/cron/deliver-webhooks/route.ts`:
+  - Passes `intent.mode` as `p_intent_mode` to any future `enqueue_webhook_delivery` calls triggered from this worker path.
+
+**Deferred to v43**
+
+- Drop the 3-arg overloads of all six per-method matchers once Phase F operator rotation is confirmed and no 3-arg calls remain in either repo.
+- Remove `WEBHOOK_SECRET` from `.env.example` and hard-delete the compatibility shim in `/api/sms-ingest`.
+- Add `/dashboard/forwarders` link to main dashboard nav.
+
+### Timeline
+
+- **2026-10-27, morning (Nouakchott)** - Third report received at `contact@solutionia.work`. Covers F1 (shared `WEBHOOK_SECRET`) and F2 (platform-wide Tier-1 matching) which had been deferred from the KP-SEC-2026-002 "Still tracked" section, plus Medium (generateRef CSPRNG) and Low (test-mode webhook mixing) also deferred from KP-SEC-2026-002 and KP-SEC-2026-003 footnotes. Each finding verified against both source trees and the live Supabase project.
+- **2026-10-27, same day** - Migration `v42_ingest_hardening.sql` (private) / `v40_ingest_hardening.sql` (OSS) written and applied to the shared Supabase project `rpgmzookqozeijtexmgl`. Code patches shipped in both repos across the new `/api/sms-ingest` Bearer auth, `/dashboard/forwarders`, `webhooks.mode` scope selector, and `generateRef` CSPRNG. Verification blocks passed. PostgREST reloaded. Public disclosure through this advisory.
+- **Phase F (pending)** - Operator (Moulaye) rotates the MacroDroid HTTP header on his forwarding phone from the shared `WEBHOOK_SECRET` value to the per-device `kpf_*` Bearer token generated in `/dashboard/forwarders`. Until this rotation is complete the legacy compatibility shim remains active.
+- **v43 follow-up (scheduled)** - Drop 3-arg matcher overloads, retire `WEBHOOK_SECRET` env var, remove compatibility shim.
+
+### Credit
+
+Reported responsibly by Bechar (`agattbechar@gmail.com`). This is Bechar's third consecutive report against KitPay, each building on the architectural residuals explicitly deferred in the preceding advisory. Findings F1 and F2 were first flagged in the KP-SEC-2026-002 "Still tracked" section and verified in KP-SEC-2026-003's F2 note; this report provided the concrete attack path, the merchant-isolation design for F2, and the specific Bearer-token architecture that became the fix. The Medium and Low findings were also drawn from deferred items in prior advisories. No payment-changing requests were made and no database interaction occurred beyond what a public API consumer would see. Thank you.
+
+---
+
 ## KP-SEC-2026-003 - Merchant table over-exposed to anon and authenticated roles, test-key reaches live intents, orphan merchant attribution regression
 
 - **Severity** : Critical (anon read of every column of `merchants` including KYC documents) + High (test API keys reach live intents GET/cancel) + Medium (orphan attribution regression bricking the reconciliation queue)
