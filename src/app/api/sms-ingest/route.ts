@@ -10,7 +10,7 @@ export const dynamic = "force-dynamic";
 // Remplace n8n : recoit le SMS brut de MacroDroid, parse, match_payment, finalise.
 // Body: { from: string, sms_body?: string, body?: string }
 // ou query param: ?sms_body=... (pour SMS multi-lignes depuis MacroDroid)
-// Header: x-webhook-secret
+// Header: Authorization: Bearer kpf_<token>  (verify_forwarder_token resolves merchant)
 
 type ParseResult = { method: string; amount: number; senderPhone: string } | null;
 
