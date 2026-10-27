@@ -20,6 +20,7 @@ export async function GET(request: NextRequest, { params }: { params: { ref: str
     .select('*')
     .eq('ref', params.ref)
     .eq('merchant_id', ctx.merchantId)
+    .eq('mode', ctx.mode)
     .maybeSingle();
 
   if (error) {

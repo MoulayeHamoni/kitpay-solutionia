@@ -21,6 +21,7 @@ export async function POST(request: NextRequest, { params }: { params: { ref: st
     .select('*')
     .eq('ref', params.ref)
     .eq('merchant_id', ctx.merchantId)
+    .eq('mode', ctx.mode)
     .maybeSingle();
 
   if (!existing) {
@@ -38,6 +39,8 @@ export async function POST(request: NextRequest, { params }: { params: { ref: st
     .update({ status: 'cancelled' })
     .eq('ref', params.ref)
     .eq('merchant_id', ctx.merchantId)
+    .eq('mode', ctx.mode)
+    .eq('status', 'pending')
     .select('*')
     .single();
 
@@ -67,7 +70,7 @@ export async function POST(request: NextRequest, { params }: { params: { ref: st
       id: `evt_${crypto.randomBytes(12).toString('hex')}`,
       type: 'payment.cancelled',
       created: Math.floor(Date.now() / 1000),
-      livemode: ctx.mode === 'live',
+      livemode: updated.mode === 'live',
       data: { object: body },
     },
   });

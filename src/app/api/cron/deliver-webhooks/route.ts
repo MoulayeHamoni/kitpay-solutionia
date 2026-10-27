@@ -1,4 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { promises as dns } from 'dns';
+import { isIP, isIPv4 } from 'net';
 import { supabaseAdmin } from '@/lib/supabase';
 import { computeSignature } from '@/lib/hmac';
 
@@ -12,6 +14,55 @@ const RETRY_SCHEDULE_SECONDS = [60, 300, 1800, 7200, 43200]; // 1m, 5m, 30m, 2h,
 const MAX_ATTEMPTS = RETRY_SCHEDULE_SECONDS.length;
 const BATCH_SIZE = 50;
 const REQUEST_TIMEOUT_MS = 10_000;
+
+// Reject merchant URLs that resolve to private networks or metadata endpoints.
+// Without this, a merchant can configure http://169.254.169.254/... as their
+// webhook URL and the delivery worker would reach the cloud metadata service.
+function ipIsPrivate(ip: string): boolean {
+  if (!isIP(ip)) return true;
+  if (isIPv4(ip)) {
+    const [a, b] = ip.split('.').map(Number);
+    if (a === 10) return true;
+    if (a === 127) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 0) return true;
+    if (a >= 224) return true;
+    return false;
+  }
+  const lower = ip.toLowerCase();
+  if (lower === '::1' || lower === '::' || lower === '::0') return true;
+  if (lower.startsWith('fe80:')) return true;
+  if (lower.startsWith('fc') || lower.startsWith('fd')) return true;
+  if (lower.startsWith('ff')) return true;
+  if (lower.startsWith('::ffff:')) return ipIsPrivate(lower.slice(7));
+  return false;
+}
+
+async function assertPublicUrl(rawUrl: string): Promise<{ ok: true } | { ok: false; reason: string }> {
+  let u: URL;
+  try { u = new URL(rawUrl); } catch { return { ok: false, reason: 'invalid_url' }; }
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') return { ok: false, reason: 'bad_protocol' };
+  const host = u.hostname;
+  if (!host) return { ok: false, reason: 'no_host' };
+  if (isIP(host)) {
+    return ipIsPrivate(host) ? { ok: false, reason: 'private_ip' } : { ok: true };
+  }
+  const lower = host.toLowerCase();
+  if (lower === 'localhost' || lower.endsWith('.localhost') || lower.endsWith('.internal') || lower.endsWith('.local')) {
+    return { ok: false, reason: 'local_hostname' };
+  }
+  try {
+    const records = await dns.lookup(host, { all: true, verbatim: true });
+    for (const r of records) {
+      if (ipIsPrivate(r.address)) return { ok: false, reason: `private_ip_resolved:${r.address}` };
+    }
+  } catch {
+    return { ok: false, reason: 'dns_failed' };
+  }
+  return { ok: true };
+}
 
 type PendingDelivery = {
   id: string;
@@ -90,6 +141,20 @@ async function handle(req: NextRequest) {
         .update({
           status: 'failed',
           response_body: 'webhook disabled or missing',
+          delivered_at: new Date().toISOString(),
+        })
+        .eq('id', d.id);
+      skipped++;
+      continue;
+    }
+
+    const urlCheck = await assertPublicUrl(w.url);
+    if (!urlCheck.ok) {
+      await sb
+        .from('webhook_deliveries')
+        .update({
+          status: 'failed',
+          response_body: `url_rejected: ${urlCheck.reason}`,
           delivered_at: new Date().toISOString(),
         })
         .eq('id', d.id);

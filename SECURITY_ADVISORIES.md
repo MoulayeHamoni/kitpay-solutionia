@@ -24,6 +24,78 @@ Each advisory contains:
 
 ---
 
+## KP-SEC-2026-003 - Merchant table over-exposed to anon and authenticated roles, test-key reaches live intents, orphan merchant attribution regression
+
+- **Severity** : Critical (anon read of every column of `merchants` including KYC documents) + High (test API keys reach live intents GET/cancel) + Medium (orphan attribution regression bricking the reconciliation queue)
+- **Status** : Fixed for F1, F3, F4, idempotency scope, and the webhook SSRF guard (OSS deliver-webhooks route). F2 (shared `WEBHOOK_SECRET`) and the first-report Finding 3 (platform-wide Tier 1 matching, including the generateRef CSPRNG) remain tracked for a follow-up architectural PR.
+- **Reported** : 2026-10-27
+- **Fixed** : 2026-10-27 (same day)
+- **Reporter** : Bechar (`agattbechar@gmail.com`)
+- **Summary** : A second static review against commit `d2375cc` surfaced four additional issues, two of which touch the payment boundary. The REST `GET /v1/intents/{ref}` and `POST /v1/intents/{ref}/cancel` endpoints did not restrict reads and writes to the API key's mode, so a merchant's own `kp_test_` key could fetch any of that merchant's live intents (including `sms_received`, `customer_phone`, `client_secret`) and cancel them while pending. The `merchants` table had `anon` `SELECT USING(true)` policy with no column restriction, letting anyone with the public anon key read `kyc_documents`, `nif`, `rc_number`, `kyc_notes`, `owner_password_hash`, `contact_email` and `owner_email` for every merchant; a parallel `members update merchant` policy let any accepted member of any role update any column, enabling self-serving KYC approval or plan upgrades. The six per-method `match_payment_*` functions inserted orphans with `merchant_id = NULL`; combined with the Tier-4 guard introduced in v40, that bricked the reconciliation workflow for 64 unresolved orphans already in production. Three smaller items worth tracking: the OSS `deliver-webhooks` route fetched merchant-supplied URLs with no SSRF filter, test-mode webhook events were still delivered to merchant endpoints with `livemode: false`, and the idempotency UNIQUE constraint did not scope by `mode`.
+
+### Details
+
+**F1 - Test API keys reach live intents (High)**
+
+`src/app/api/v1/intents/[ref]/route.ts` (GET) and `src/app/api/v1/intents/[ref]/cancel/route.ts` (POST) filtered the Supabase query by `ref` and `merchant_id` from the authenticated key's context, but never by `mode`. A merchant's own `kp_test_` key could therefore read and cancel their live intents. The GET response was serialized under the key's mode (test), which still returned `sms_received`, `customer_phone`, `client_secret` and the full intent payload. The cancellation webhook took its `livemode` flag from the API key's mode, not from the intent being cancelled, so a live-mode cancellation emitted an event marked `livemode: false`. The cancel UPDATE also lacked a `status='pending'` guard, leaving a check-then-update race.
+
+**F2 - Shared `WEBHOOK_SECRET` for `/api/sms-ingest` (Critical conditional on reachability)**
+
+`src/app/api/sms-ingest/route.ts:87-90` validates one global `WEBHOOK_SECRET` environment variable for every caller. Nothing in the request is bound to a specific merchant or forwarder device. `docs/android-setup.md` has the operator paste this secret into the MacroDroid configuration on every forwarding phone. In a multi-forwarder deployment, any party who obtains the secret from any forwarder config can submit a correctly-formatted synthetic SMS and the matcher pipeline will mark a legitimate matching live, pending, unexpired intent as paid, emit the signed `payment.succeeded` webhook, send the receipt email, and update dashboards. The attack is bounded by the matching logic: the amount and expected_phone must line up for Tier 1, or the amount-only fallback must be unambiguous. In the current production deployment the forwarder count is one (operator-owned), which bounds reachability today but does not solve the design flaw.
+
+**F3 - Orphan rows from per-method matchers have `merchant_id = NULL` (Medium)**
+
+The six per-method matchers (`match_payment_bankily`, `_masrvi`, `_bim`, `_sedad`, `_click`, `_bcipay`) built in v26-v36 all insert into `orphan_sms` using the 4-column form (no `merchant_id`), falling back to the column default (`NULL`). The reconciliation page and server action filter orphans by `merchant_id = <caller's merchant>`, so these orphans were never visible from any dashboard; v40 then added the `merchant_id IS NULL` guard inside `reconcile_orphan`, which blocked even the super-admin path. 64 unresolved orphan rows in production were in this state at report time.
+
+**F4 - Merchant table over-exposed (Critical)**
+
+`v14_rls_enable.sql:40-50` and the live `pg_policies` state agreed on two problematic policies:
+
+- `anon read merchant public fields` : `FOR SELECT TO anon USING (true)` with no column restriction, over a table whose columns include `owner_password_hash`, `nif`, `rc_number`, `kyc_notes`, `kyc_documents` (jsonb payload including the uploaded KYC files JSON structure), `contact_email`, `owner_email`.
+- `members update merchant` : `FOR UPDATE TO authenticated USING(user_is_member_of(id) OR is_super_admin())` with no column-level restriction and no check against `merchant_members.role`. Any accepted member of any role could update their own merchant's `status`, `plan_id`, `kyc_verified_at`, `kyc_notes`, `kyc_documents` or `owner_password_hash`, enabling self-serving KYC approval and plan upgrades.
+
+The effective privileges in production confirm this is not conditional: `anon` and `authenticated` both hold `SELECT`, `INSERT`, `UPDATE`, `DELETE` on `public.merchants` at the table-privilege level, and RLS does the filtering. Three merchants in production had `kyc_documents` populated at report time; `nif` and `rc_number` were populated for one of them. `owner_password_hash` was not populated for any merchant, which is why no credentials have leaked, but the write path for that column was reachable from any authenticated member session.
+
+**Smaller items**
+
+- `src/app/api/cron/deliver-webhooks/route.ts` fetches `webhooks.url` directly from a merchant-controlled column. A merchant configuring `http://169.254.169.254/latest/meta-data/` or `http://127.0.0.1:...` reaches the cloud metadata service or any service bound to the Netlify/Vercel egress interface. The production deployment delivers webhooks via n8n, not this route, so the exposed path only applies to self-hosted operators of the OSS code - but the shape is still worth fixing in the public source.
+- Test-mode intents emit webhooks to the same merchant subscription with `livemode: false`. Separate test-mode endpoints or an explicit subscription per mode would be cleaner.
+- `idempotency_keys` carried `UNIQUE(merchant_id, key)` without `mode`. A merchant replaying a key across test and live would collide.
+
+### Fix
+
+Migration [`supabase/v39_followup_bechar.sql`](./supabase/v39_followup_bechar.sql) (private deployment repo mirrors it as `v41`):
+
+- Drops the `anon read merchant public fields` and `members update merchant` policies on `merchants`. All reads and writes in the application already go through the admin (service_role) client (`createSupabaseAdminClient`), so the two removed policies were unused in the live code paths. `members read merchant` is kept for future use since the dashboard reads continue through `service_role` today.
+- Rewrites the six per-method matchers to resolve a fallback `merchant_id` from `merchant_operators` (single enabled merchant for the method) and attribute every `orphan_sms` row at insert time. If multiple merchants have the method enabled the orphan goes to the super-admin-only queue. Each function keeps the hardening introduced in v37/v38 (`SECURITY DEFINER`, `SET search_path = public, extensions, pg_temp`).
+- Backfills unresolved orphans in production where derivable (`parsed_method` → single enabled merchant).
+- Adds `mode` to `idempotency_keys` and recreates the `UNIQUE(merchant_id, key, mode)` constraint.
+- Automated verification blocks fail-fast if the merchants policies remain or if the attribution block is missing from any of the six functions.
+
+Code patches (both repos):
+
+- `src/app/api/v1/intents/[ref]/route.ts` : `GET` adds `.eq('mode', ctx.mode)` to the lookup.
+- `src/app/api/v1/intents/[ref]/cancel/route.ts` : `POST` adds `.eq('mode', ctx.mode)` to the lookup and the UPDATE, adds `.eq('status', 'pending')` to the UPDATE to close the race, and derives `livemode` from the updated intent (`updated.mode === 'live'`) rather than from the API key.
+- OSS only - `src/app/api/cron/deliver-webhooks/route.ts` : adds an `assertPublicUrl()` guard that rejects URLs resolving to RFC1918, loopback, link-local (including the IMDS `169.254.169.254`), ULA, multicast, hostnames ending in `.localhost / .internal / .local`, and non-http(s) protocols. Rejected deliveries are marked `failed` with `response_body = 'url_rejected: <reason>'`.
+
+Still tracked for a follow-up architectural PR (same batch as the first-report Finding 3):
+
+- F2 (shared `WEBHOOK_SECRET`) : per-device or per-merchant ingest credentials, server-side binding of merchant/device identity, replay protection, rotation.
+- First-report Finding 3 : threading the receiving merchant identity through `/api/sms-ingest` so Tier 1 matching is merchant-scoped. The orphan attribution introduced in v41/v39 is a correct interim since it uses the same single-merchant assumption.
+- `generateRef()` migrates from `Math.random()` to the `randomBytes` helper in `src/lib/api/intents.ts`.
+- Test-mode webhook delivery isolation.
+
+### Timeline
+
+- **2026-10-27, morning (Nouakchott)** - Follow-up report received at `contact@solutionia.work` against commit `d2375cc`. Every finding verified against both source trees and live Supabase privileges (including a live check that confirmed `anon` and `authenticated` hold full table privileges on `merchants`, confirming F4 is unconditional).
+- **2026-10-27, same day** - Migration `v41_followup_bechar.sql` (private) / `v39_followup_bechar.sql` (public OSS) applied to the shared Supabase project, code patches shipped in both repos, verification blocks passed, PostgREST reloaded. Public disclosure through this advisory.
+
+### Credit
+
+Reported responsibly by Bechar (`agattbechar@gmail.com`). The follow-up derived from static review of the public source plus unauthenticated loads of the deployed site's public pages and JS bundles, with no payment-changing requests sent and no database interaction. The report corrected two assessments: F3 was initially downgraded as "the dashboard already filtered these" but v40's Tier-4 guard made the regression a live operational problem (64 stuck orphans) rather than a non-issue, and F4 was offered as conditional on effective grants but was in fact unconditional in production. Thank you.
+
+---
+
 ## KP-SEC-2026-002 - Anon-callable state-mutating RPCs (webhook forgery, cross-tenant reconciliation IDOR, API-key oracle) + orphan RLS policy regression
 
 - **Severity** : Critical (webhook forgery) + High (reconciliation IDOR) + Medium (API-key oracle, orphan policy)
