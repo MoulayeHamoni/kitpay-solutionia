@@ -99,6 +99,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
   const authRow = Array.isArray(authData) ? authData[0] : authData;
+  const callerDeviceId: string = (authRow as { device_id: string }).device_id;
   const callerMerchantId: string = (authRow as { merchant_id: string }).merchant_id;
 
   // --- 2. Body ---
@@ -120,6 +121,25 @@ export async function POST(req: NextRequest) {
   if (!rawSms) {
     return NextResponse.json({ error: "SMS body manquant" }, { status: 400 });
   }
+
+  // --- 2b. Dedupe : (device_id, sha256(sms)) unique dans la fenetre 24h ---
+  const crypto = await import('crypto');
+  const smsHash = crypto.createHash('sha256').update(rawSms.trim()).digest('hex');
+  const { data: dedupeData, error: dedupeErr } = await sb
+    .from('sms_ingest_dedupe')
+    .insert({ device_id: callerDeviceId, sms_hash: smsHash })
+    .select()
+    .maybeSingle();
+  if (dedupeErr && dedupeErr.code === '23505') {
+    // duplicate key = already processed within 24h
+    return NextResponse.json({ ok: true, matched: false, reason: 'duplicate_sms_within_24h' });
+  }
+  if (dedupeErr) {
+    console.error('[sms-ingest] dedupe insert error', dedupeErr);
+    // fail-closed: refuse to process rather than risk double-processing
+    return NextResponse.json({ error: 'dedupe_failed' }, { status: 500 });
+  }
+  void dedupeData; // acknowledged, not used further
 
   // --- 3. Parse ---
   const parsed = parseSms(from, rawSms);
