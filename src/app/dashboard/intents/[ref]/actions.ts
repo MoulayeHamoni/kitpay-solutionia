@@ -20,7 +20,7 @@ export async function replayWebhooks(ref: string) {
   const { merchant } = await requireMerchant();
   const admin = createSupabaseAdminClient();
   const { data: failed } = await admin
-    .from('webhook_deliveries')
+    .from('webhook_deliveries_safe')
     .select('id')
     .eq('merchant_id', merchant.id)
     .in('status', ['failed', 'expired']);

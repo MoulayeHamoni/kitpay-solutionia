@@ -8,7 +8,7 @@ export default async function WebhookDeliveryLog({ params }: { params: { id: str
     .eq('id', params.id).eq('merchant_id', merchant.id).maybeSingle();
   if (!webhook) notFound();
 
-  const { data: deliveries } = await supabase.from('webhook_deliveries')
+  const { data: deliveries } = await supabase.from('webhook_deliveries_safe')
     .select('*').eq('webhook_id', params.id).eq('merchant_id', merchant.id)
     .order('created_at', { ascending: false }).limit(100);
 
