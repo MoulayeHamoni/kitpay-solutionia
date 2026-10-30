@@ -1,12 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseAdmin } from "@/lib/supabase";
-
-function checkAuth(req: NextRequest) {
-  return req.headers.get("x-admin-pwd") === process.env.ADMIN_PASSWORD;
-}
+import { checkAdminAuth } from "@/lib/admin-auth";
 
 export async function GET(req: NextRequest) {
-  if (!checkAuth(req)) {
+  if (new URL(req.url).searchParams.has('pwd')) {
+    return NextResponse.json({ error: 'unauthorized' }, { status: 401 });
+  }
+  if (!checkAdminAuth(req)) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
   const sb = supabaseAdmin();

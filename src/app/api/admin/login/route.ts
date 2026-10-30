@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
-import { timingSafeEqual } from "crypto";
+import { assertAdminAuthConfigured, checkAdminAuth } from "@/lib/admin-auth";
+
+assertAdminAuthConfigured();  // throws at module-load if unset/default/short
 
 // In-memory rate limiter: max 5 attempts per IP per 15 min
 const attempts = new Map<string, { count: number; resetAt: number }>();
@@ -30,6 +32,10 @@ function resetAttempts(ip: string): void {
 }
 
 export async function POST(req: NextRequest) {
+  if (new URL(req.url).searchParams.has('pwd')) {
+    return NextResponse.json({ error: 'unauthorized' }, { status: 401 });
+  }
+
   const ip = getIp(req);
 
   if (isRateLimited(ip)) {
@@ -39,6 +45,9 @@ export async function POST(req: NextRequest) {
     );
   }
 
+  // The login route checks the password from the request body (not the header),
+  // so we re-implement the check inline rather than calling checkAdminAuth which
+  // reads from the x-admin-pwd header.
   const body = await req.json().catch(() => ({}));
   const { password } = body;
 
@@ -46,10 +55,12 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "invalid" }, { status: 401 });
   }
 
-  const expected = process.env.ADMIN_PASSWORD ?? "";
-  const match =
-    password.length === expected.length &&
-    timingSafeEqual(Buffer.from(password), Buffer.from(expected));
+  // Use checkAdminAuth via a synthetic request that has the password in the
+  // x-admin-pwd header, so the timingSafeEqual path is shared.
+  const syntheticReq = new Request(req.url, {
+    headers: { 'x-admin-pwd': password },
+  });
+  const match = checkAdminAuth(syntheticReq as unknown as NextRequest);
 
   if (match) {
     resetAttempts(ip);

@@ -1,14 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseAdmin } from "@/lib/supabase";
 import { slugify } from "@/lib/format";
-
-function checkAuth(req: NextRequest) {
-  return req.headers.get("x-admin-pwd") === process.env.ADMIN_PASSWORD;
-}
+import { checkAdminAuth } from "@/lib/admin-auth";
 
 // POST : créer un produit
 export async function POST(req: NextRequest) {
-  if (!checkAuth(req)) {
+  if (new URL(req.url).searchParams.has('pwd')) {
+    return NextResponse.json({ error: 'unauthorized' }, { status: 401 });
+  }
+  if (!checkAdminAuth(req)) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
   const body = await req.json();
@@ -59,7 +59,10 @@ export async function POST(req: NextRequest) {
 
 // PUT : modifier un produit existant
 export async function PUT(req: NextRequest) {
-  if (!checkAuth(req)) {
+  if (new URL(req.url).searchParams.has('pwd')) {
+    return NextResponse.json({ error: 'unauthorized' }, { status: 401 });
+  }
+  if (!checkAdminAuth(req)) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
   const body = await req.json();
