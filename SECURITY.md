@@ -70,4 +70,8 @@ Notable contributors:
   `KP-SEC-2026-004` (shared `WEBHOOK_SECRET` synthetic-SMS forgery,
   platform-wide Tier-1 cross-merchant intent absorption, weak `generateRef`
   entropy, test-mode webhook mixing) on 2026-10-27 via static review of
-  the public source and verification of the deployed infrastructure.
+  the public source and verification of the deployed infrastructure;
+  reported `KP-SEC-2026-005` (round-3 deep audit -- INSTALL path,
+  verification-block correctness, SSRF defense-in-depth, admin backdoor,
+  oldest-merchant fallback, generateRef entropy and location, phone
+  canonicalization, open redirect, receipt email escape) on 2026-10-30.
