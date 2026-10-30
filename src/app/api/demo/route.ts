@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { randomBytes } from "crypto";
 import { supabaseAdmin } from "@/lib/supabase";
 import { generateRef } from "@/lib/format";
+import { canonicalMauritanianPhone } from "@/lib/phone";
 
 const VALID_METHODS = ["Bankily", "Masrvi", "Sedad", "BIM", "Click"];
 const DEMO_PRODUCT_ID = "__kitpay_demo__";
@@ -11,22 +12,29 @@ const DEMO_PRODUCT_ID = "__kitpay_demo__";
 const DEMO_MIN_AMOUNT = 5;
 const DEMO_MAX_AMOUNT = 100;
 
-// Sandbox merchant: read from env, or fall back to the first merchant in DB.
-// Set SANDBOX_MERCHANT_ID in production to the UUID of the merchant that owns
-// the /sandbox page. Leave unset to disable the sandbox in production.
-const CONFIGURED_SANDBOX_MERCHANT_ID = process.env.SANDBOX_MERCHANT_ID ?? null;
+// No fallback. If the env var isn't set, the sandbox is disabled.
+// Fallback to "first merchant" would silently create live-mode intents against an unintended merchant.
+const SANDBOX_MERCHANT_ID = process.env.SANDBOX_MERCHANT_ID ?? null;
 
-async function resolveSandboxMerchantId(
-  sb: ReturnType<typeof supabaseAdmin>
-): Promise<string | null> {
-  if (CONFIGURED_SANDBOX_MERCHANT_ID) return CONFIGURED_SANDBOX_MERCHANT_ID;
-  const { data } = await sb
-    .from("merchants")
-    .select("id")
-    .order("created_at", { ascending: true })
-    .limit(1)
-    .maybeSingle();
-  return data?.id ?? null;
+async function resolveSandboxMerchantId(_sb: ReturnType<typeof supabaseAdmin>): Promise<string | null> {
+  // No fallback. If the env var isn't set, the sandbox is disabled.
+  // Fallback to "first merchant" would silently create live-mode intents against an unintended merchant.
+  return SANDBOX_MERCHANT_ID;
+}
+
+// In-memory rate limiter for the demo endpoint
+const demoRateBuckets = new Map<string, { count: number; resetAt: number }>();
+const DEMO_RATE_LIMIT = 5;              // 5 requests
+const DEMO_RATE_WINDOW_MS = 60_000;     // per 60 seconds per IP
+function tooManyDemoRequests(ip: string): boolean {
+  const now = Date.now();
+  const b = demoRateBuckets.get(ip);
+  if (!b || b.resetAt < now) {
+    demoRateBuckets.set(ip, { count: 1, resetAt: now + DEMO_RATE_WINDOW_MS });
+    return false;
+  }
+  b.count += 1;
+  return b.count > DEMO_RATE_LIMIT;
 }
 
 // Public sandbox endpoint: creates a payment_intent without authentication.
@@ -37,7 +45,12 @@ export async function POST(req: NextRequest) {
   try {
     const { phone, method, amount, label, email } = await req.json();
 
-    const cleanPhone = (phone || "").replace(/\s+/g, "").replace(/^\+?222/, "");
+    const ip = req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ?? 'unknown';
+    if (tooManyDemoRequests(ip)) {
+      return NextResponse.json({ error: 'rate_limit' }, { status: 429 });
+    }
+
+    const cleanPhone = canonicalMauritanianPhone(phone);
     if (!cleanPhone || cleanPhone.length < 8) {
       return NextResponse.json({ error: "Numero invalide (8 chiffres minimum)" }, { status: 400 });
     }
@@ -69,7 +82,7 @@ export async function POST(req: NextRequest) {
     const sandboxMerchantId = await resolveSandboxMerchantId(sb);
     if (!sandboxMerchantId) {
       return NextResponse.json(
-        { error: "Sandbox is disabled: no merchant configured (set SANDBOX_MERCHANT_ID or create a merchant)." },
+        { error: "Sandbox is disabled: SANDBOX_MERCHANT_ID is not set." },
         { status: 503 }
       );
     }
