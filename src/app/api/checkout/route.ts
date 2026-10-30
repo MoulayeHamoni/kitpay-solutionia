@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { supabaseAdmin } from "@/lib/supabase";
 import { fetchProductById } from "@/lib/products";
 import { generateRef } from "@/lib/format";
+import { canonicalMauritanianPhone } from "@/lib/phone";
 
 const VALID_METHODS = ["Bankily", "Masrvi", "Sedad", "BIM", "Click"];
 
@@ -23,7 +24,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Email invalide" }, { status: 400 });
     }
 
-    const cleanPhone = phone.replace(/\s+/g, "").replace(/^\+?222/, "");
+    const cleanPhone = canonicalMauritanianPhone(phone);
 
     const sb = supabaseAdmin();
     const ref = generateRef();

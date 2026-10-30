@@ -5,6 +5,7 @@ import { hashBody, lookupIdempotency, saveIdempotency } from '@/lib/api/idempote
 import { checkRateLimit } from '@/lib/api/rate-limit';
 import { logApiCall } from '@/lib/api/audit';
 import { generateRef, generateClientSecret, validateInput, serializeIntent, type IntentRecord } from '@/lib/api/intents';
+import { canonicalMauritanianPhone } from '@/lib/phone';
 import {
   errBadRequest, errUnauthorized, errForbidden, errConflict, errUnprocessable,
   errRateLimit, errInternal, errorResponse,
@@ -124,8 +125,8 @@ export async function POST(request: NextRequest) {
       method: input.method,
       mode: ctx.mode,
       status: 'pending',
-      expected_phone: input.customer_phone ?? operatorPhone ?? '',
-      customer_phone: input.customer_phone ?? null,
+      expected_phone: input.customer_phone ? canonicalMauritanianPhone(input.customer_phone) : (operatorPhone ?? ''),
+      customer_phone: input.customer_phone ? canonicalMauritanianPhone(input.customer_phone) : null,
       description: input.description ?? null,
       success_url: input.success_url ?? null,
       cancel_url: input.cancel_url ?? null,
