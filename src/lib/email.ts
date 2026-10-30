@@ -46,6 +46,10 @@ export async function sendReceiptEmail(
   }
 }
 
+function escapeHtml(s: string): string {
+  return (s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
 function buildReceiptHtml(intent: PaymentIntent): string {
   const paidAt = intent.paid_at
     ? new Date(intent.paid_at).toLocaleString("fr-FR", {
@@ -58,7 +62,7 @@ function buildReceiptHtml(intent: PaymentIntent): string {
 <html lang="fr">
 <head>
 <meta charset="UTF-8">
-<title>Reçu ${intent.ref}</title>
+<title>Reçu ${escapeHtml(intent.ref)}</title>
 </head>
 <body style="margin:0;padding:0;background:#f5f5f4;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
   <table width="100%" cellpadding="0" cellspacing="0" style="background:#f5f5f4;padding:32px 16px;">
@@ -96,7 +100,7 @@ function buildReceiptHtml(intent: PaymentIntent): string {
             <td style="padding:0 24px 24px;text-align:center;">
               <div style="background:#fafaf9;border-radius:8px;padding:20px;">
                 <div style="font-size:32px;font-weight:600;color:#1c1917;">${formatMRU(intent.amount)}</div>
-                <div style="font-size:13px;color:#78716c;margin-top:4px;">${intent.product_name}</div>
+                <div style="font-size:13px;color:#78716c;margin-top:4px;">${escapeHtml(intent.product_name)}</div>
               </div>
             </td>
           </tr>
@@ -105,13 +109,13 @@ function buildReceiptHtml(intent: PaymentIntent): string {
           <tr>
             <td style="padding:0 24px 24px;">
               <table width="100%" style="font-size:13px;">
-                ${rowHtml("Référence", intent.ref, true)}
-                ${rowHtml("Mode de paiement", intent.method)}
-                ${rowHtml("Numéro déclaré", intent.expected_phone)}
+                ${rowHtml("Référence", escapeHtml(intent.ref), true)}
+                ${rowHtml("Mode de paiement", escapeHtml(intent.method))}
+                ${rowHtml("Numéro déclaré", escapeHtml(intent.expected_phone ?? ''))}
                 ${
                   intent.actual_sender_phone &&
                   intent.actual_sender_phone !== intent.expected_phone
-                    ? rowHtml("Numéro payeur", intent.actual_sender_phone)
+                    ? rowHtml("Numéro payeur", escapeHtml(intent.actual_sender_phone))
                     : ""
                 }
                 ${rowHtml("Confirmé le", paidAt)}
