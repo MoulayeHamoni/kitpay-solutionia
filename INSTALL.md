@@ -112,7 +112,16 @@ v33_restrict_intent_anon_access.sql
 v34_tier2_collision_guard.sql
 v35_match_payment_bcipay.sql
 v36_match_payment_bankily.sql
+v37_lockdown_match_payment_rpcs.sql    (KP-SEC-2026-001)
+v38_lockdown_remaining_rpcs.sql        (KP-SEC-2026-002)
+v39_followup_bechar.sql                (KP-SEC-2026-003)  -- NOTE: superseded par v41 si vous installez de zero (v39 contient un bug window-function-in-HAVING qui avorte la transaction)
+v40_ingest_hardening.sql               (KP-SEC-2026-004)
+v41_round3_hardening.sql               (KP-SEC-2026-005)  -- supersede v39 pour les fresh installs
 ```
+
+Les migrations v37 a v41 fixent des vulnerabilites de securite publiees dans SECURITY_ADVISORIES.md. **Elles doivent toutes etre appliquees.** Un deploy a partir de v36 reste expose aux CVE KP-SEC-2026-001 a 005.
+
+Si vous installez a partir de zero (database vide), appliquez schema.sql + migration_v2 a v38 + v40 + v41 (dans cet ordre, en sautant v39 qui est casse). Si vous avez deja applique v39 (en pensant qu'elle avait reussi), rejouez v41 : elle est idempotente et re-ecrit tout ce que v39 n'a pas pu commiter.
 
 > **Astuce** : chaque fichier se termine par un `SELECT '<vNN> applied' AS info`
 > qui vous confirme le passage. Si un `RAISE NOTICE` s'affiche, lisez-le :
@@ -134,6 +143,27 @@ WHERE table_schema = 'public'
 Creer le bucket de stockage KYC :
 - Aller dans **Storage** > **New bucket** > nom : `kyc-documents` > **Private**.
 - Les policies sont deja creees par la migration v25.
+
+Verifier que la chaine de securite v37-v41 est correctement appliquee :
+
+```sql
+-- Verification post-migration : les fonctions SECURITY DEFINER doivent toutes etre service_role-only
+WITH fns AS (
+  SELECT p.oid, p.proname||'/'||p.pronargs AS sig
+  FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+  WHERE n.nspname='public' AND p.proname IN (
+    'match_payment_bankily','match_payment_masrvi','match_payment_bim',
+    'match_payment_sedad','match_payment_click','match_payment_bcipay',
+    'enqueue_webhook_delivery','reconcile_orphan','verify_api_key','verify_forwarder_token'
+  )
+)
+SELECT sig,
+  has_function_privilege('anon', oid, 'EXECUTE') AS anon_can_execute,
+  has_function_privilege('authenticated', oid, 'EXECUTE') AS auth_can_execute
+FROM fns ORDER BY sig;
+-- Expected: toutes les colonnes anon_can_execute et auth_can_execute = false.
+-- Si vous voyez true quelque part, votre schema est mal verrouille -- ne demarrez pas en prod.
+```
 
 ---
 
@@ -283,8 +313,9 @@ Resume rapide (avec l'application SMS Forwarder de Bogdan Tudose) :
     `Click`, `Sedad`, `BCIPAY`.
   - URL cible : `https://<votre-domaine>/api/sms-ingest`.
   - Methode : `POST`.
-  - Headers : `x-webhook-secret: <VOTRE WEBHOOK_SECRET>` et
+  - Headers : `Authorization: Bearer kpf_<token copie depuis le dashboard>` et
     `Content-Type: application/json`.
+  - Le token se cree dans `Dashboard -> Forwarders -> Nouveau forwarder`.
   - Body : `{"from": "%from%", "sms_body": "%text%"}`.
 - Autoriser la lecture des SMS et desactiver l'optimisation batterie
   pour l'application.
@@ -377,7 +408,7 @@ Si oui, l'installation est terminee. Bravo.
 1. Verifier dans l'application forwarder que le SMS a bien ete envoye
    (icone verte dans l'historique).
 2. Verifier les logs Netlify/Vercel : chercher `sms-ingest`. Une
-   reponse `401 unauthorized` = mauvais `WEBHOOK_SECRET`. Une reponse
+   reponse `401 unauthorized` = token Bearer invalide ou absent (verifier le header `Authorization: Bearer kpf_<token>` dans le forwarder). Une reponse
    `parse_failed` = format SMS non reconnu par le parser.
 3. Verifier dans Supabase la table `orphan_sms` : si le SMS y est, la
    ligne aura le contenu brut, ce qui aide a debugger le parser.
