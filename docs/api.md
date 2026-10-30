@@ -36,7 +36,7 @@ Cree un intent de paiement.
 {
   "amount": 5000,
   "method": "Bankily",
-  "customer_phone": "+222 46 XX XX XX",
+  "customer_phone": "46112233",
   "description": "Commande #1234",
   "success_url": "https://votre-site.com/kitpay/success",
   "cancel_url": "https://votre-site.com/kitpay/cancel",
@@ -45,11 +45,22 @@ Cree un intent de paiement.
 }
 ```
 
+### `customer_phone` (string, requis)
+
+Numero du client qui va envoyer le paiement, au format canonique 8 chiffres de Mauritanie (sans espaces, sans `+222`, sans tiret). Exemple : `"46112233"`.
+
+Le serveur canonicalise automatiquement les variantes humaines a l'entree (strip des espaces, du `+222`, des tirets, des parentheses). Les formats accepts :
+- `"46112233"` (canonique, 8 chiffres)
+- `"+222 46 11 22 33"` (avec espaces et prefixe pays -- canonicalise cote serveur)
+- `"+22246112233"` (sans espaces, avec prefixe)
+
+Si vous stockez le numero chez vous, stockez la forme canonique a 8 chiffres : c'est celle qui est comparee au telephone extrait des SMS d'operateurs (qui sortent toujours en 8 chiffres).
+
 | Champ                | Type                              | Obligatoire | Note                                           |
 |----------------------|-----------------------------------|-------------|------------------------------------------------|
 | amount               | entier positif (MRU)              | oui         | Entre 1 et 1 000 000.                         |
 | method               | enum                              | oui         | `Bankily`, `Masrvi`, `Sedad`, `BIM`, `Click`, `BCIPAY` |
-| customer_phone       | chaine                            | non         | Numero du payeur. Ameliore le matching Tier 1. |
+| customer_phone       | chaine                            | non         | Numero du payeur au format 8 chiffres (voir ci-dessus). Ameliore le matching Tier 1. |
 | description          | chaine <= 255                     | non         | Affiche sur la page hosted et le recu email.   |
 | success_url          | URL http(s)                       | non         | Redirection apres paiement reussi.             |
 | cancel_url           | URL http(s)                       | non         | Redirection apres annulation ou expiration.    |
@@ -69,7 +80,7 @@ Cree un intent de paiement.
   "matched_tier": null,
   "merchant_phone": "+222 46 XX XX XX",
   "merchant_code": null,
-  "customer_phone": "+222 46 XX XX XX",
+  "customer_phone": "46112233",
   "description": "Commande #1234",
   "success_url": "https://votre-site.com/kitpay/success",
   "cancel_url": "https://votre-site.com/kitpay/cancel",
