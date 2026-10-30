@@ -1,19 +1,13 @@
 import { randomBytes } from 'crypto';
 
-const REF_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // base32 sans 0/1/I/O
-const REF_LENGTH = 6;
-
-/**
- * Generate a unique-ish 6-char ref like "KP-A3F9X2".
- * Caller must check DB for collision (very rare with 32^6 = 1B combinations).
- */
+// 10 chars from base64url, stripped of -/_, uppercased, retried if shorter than 10.
+// ~59 bits of entropy — matches the implementation in src/lib/format.ts.
 export function generateRef(): string {
-  const bytes = randomBytes(REF_LENGTH);
-  let chars = '';
-  for (let i = 0; i < REF_LENGTH; i++) {
-    chars += REF_ALPHABET[bytes[i] % REF_ALPHABET.length];
+  let rand = '';
+  while (rand.length < 10) {
+    rand += randomBytes(8).toString('base64url').replace(/[-_]/g, '').toUpperCase();
   }
-  return `KP-${chars}`;
+  return 'KP-' + rand.slice(0, 10);
 }
 
 export function generateClientSecret(): string {
