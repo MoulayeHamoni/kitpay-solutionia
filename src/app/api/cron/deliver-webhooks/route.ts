@@ -15,9 +15,9 @@ const MAX_ATTEMPTS = RETRY_SCHEDULE_SECONDS.length;
 const BATCH_SIZE = 50;
 const REQUEST_TIMEOUT_MS = 10_000;
 
-// Reject merchant URLs that resolve to private networks or metadata endpoints.
-// Without this, a merchant can configure http://169.254.169.254/... as their
-// webhook URL and the delivery worker would reach the cloud metadata service.
+// Reject IPs that belong to private, loopback, link-local, multicast, or
+// CGNAT ranges. Any IP that fails isIP() is also treated as private to fail
+// closed on unexpected input.
 function ipIsPrivate(ip: string): boolean {
   if (!isIP(ip)) return true;
   if (isIPv4(ip)) {
@@ -27,6 +27,7 @@ function ipIsPrivate(ip: string): boolean {
     if (a === 169 && b === 254) return true;
     if (a === 172 && b >= 16 && b <= 31) return true;
     if (a === 192 && b === 168) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 CGNAT — some clouds route metadata here
     if (a === 0) return true;
     if (a >= 224) return true;
     return false;
@@ -40,28 +41,63 @@ function ipIsPrivate(ip: string): boolean {
   return false;
 }
 
-async function assertPublicUrl(rawUrl: string): Promise<{ ok: true } | { ok: false; reason: string }> {
+type UrlCheckOk = { ok: true; url: string; headers: Record<string, string> };
+type UrlCheckFail = { ok: false; reason: string };
+
+// Resolves the hostname and pins the fetch URL to a concrete public IP (http only).
+// This defeats two SSRF vectors:
+//   1. Redirect chain: we pass redirect:'manual' to fetch, so 3xx never followed.
+//   2. DNS rebinding: for http we substitute the resolved IP so the OS does not
+//      re-resolve on the actual TCP connect (which could return a private IP).
+//
+// For https we cannot substitute the IP because doing so would break TLS: the
+// certificate is validated against the hostname, not the IP. Instead we pass the
+// original URL with redirect:'manual'. DNS rebinding on https also requires the
+// attacker to hold a valid TLS certificate for the private target host — a much
+// higher bar. If that threat model ever needs addressing, an egress proxy with
+// a fixed allow-list is the right control, not application-layer DNS pinning.
+async function resolveAndPinUrl(rawUrl: string): Promise<UrlCheckOk | UrlCheckFail> {
   let u: URL;
   try { u = new URL(rawUrl); } catch { return { ok: false, reason: 'invalid_url' }; }
   if (u.protocol !== 'https:' && u.protocol !== 'http:') return { ok: false, reason: 'bad_protocol' };
   const host = u.hostname;
   if (!host) return { ok: false, reason: 'no_host' };
+
+  // Literal IP in URL — validate directly without DNS.
   if (isIP(host)) {
-    return ipIsPrivate(host) ? { ok: false, reason: 'private_ip' } : { ok: true };
+    if (ipIsPrivate(host)) return { ok: false, reason: 'private_ip' };
+    return { ok: true, url: rawUrl, headers: {} };
   }
+
   const lower = host.toLowerCase();
   if (lower === 'localhost' || lower.endsWith('.localhost') || lower.endsWith('.internal') || lower.endsWith('.local')) {
     return { ok: false, reason: 'local_hostname' };
   }
+
+  let records: import('dns').LookupAddress[];
   try {
-    const records = await dns.lookup(host, { all: true, verbatim: true });
-    for (const r of records) {
-      if (ipIsPrivate(r.address)) return { ok: false, reason: `private_ip_resolved:${r.address}` };
-    }
+    records = await dns.lookup(host, { all: true, verbatim: true });
   } catch {
     return { ok: false, reason: 'dns_failed' };
   }
-  return { ok: true };
+
+  const publicIps = records.filter((r) => !ipIsPrivate(r.address));
+  if (publicIps.length === 0) return { ok: false, reason: 'no_public_ip' };
+  // Reject split-horizon configs where some records are private — could indicate
+  // a partial DNS rebinding setup.
+  if (publicIps.length < records.length) return { ok: false, reason: 'mixed_private_public_ips' };
+
+  if (u.protocol === 'http:') {
+    // Pin to first resolved public IP so Node does not re-resolve on connect.
+    const ip = publicIps[0].address;
+    const pinned = new URL(rawUrl);
+    pinned.hostname = publicIps[0].family === 6 ? `[${ip}]` : ip;
+    // Preserve original Host header so the target server routes the vhost correctly.
+    return { ok: true, url: pinned.toString(), headers: { Host: host } };
+  }
+
+  // https: use original URL; TLS cert validation against hostname provides rebinding resistance.
+  return { ok: true, url: rawUrl, headers: {} };
 }
 
 type PendingDelivery = {
@@ -74,7 +110,12 @@ type PendingDelivery = {
   webhooks: { url: string; secret: string; enabled: boolean } | null;
 };
 
-async function postWithTimeout(url: string, body: string, signature: string) {
+async function postWithTimeout(
+  url: string,
+  body: string,
+  signature: string,
+  extraHeaders: Record<string, string>
+) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
@@ -84,10 +125,20 @@ async function postWithTimeout(url: string, body: string, signature: string) {
         'Content-Type': 'application/json',
         'X-KitPay-Signature': signature,
         'User-Agent': 'KitPay-Webhook/1.0',
+        ...extraHeaders,
       },
       body,
       signal: controller.signal,
+      redirect: 'manual', // never follow redirects — 3xx is a hard failure
     });
+    // fetch with redirect:'manual' returns an opaque redirect response (type
+    // 'opaqueredirect', status 0) for 3xx on cross-origin requests. On same-
+    // origin or in some Node runtimes it may still return the 3xx status code
+    // directly. Handle both.
+    if (res.type === 'opaqueredirect' || (res.status >= 300 && res.status < 400)) {
+      const location = res.headers.get('location') ?? '<unknown>';
+      return { httpStatus: 0, responseBody: `redirect_blocked: ${location}`.slice(0, 2000) };
+    }
     const text = await res.text().catch(() => '');
     return { httpStatus: res.status, responseBody: text.slice(0, 2000) };
   } catch (err) {
@@ -148,7 +199,7 @@ async function handle(req: NextRequest) {
       continue;
     }
 
-    const urlCheck = await assertPublicUrl(w.url);
+    const urlCheck = await resolveAndPinUrl(w.url);
     if (!urlCheck.ok) {
       await sb
         .from('webhook_deliveries')
@@ -164,7 +215,7 @@ async function handle(req: NextRequest) {
 
     const body = JSON.stringify(d.payload);
     const signature = computeSignature(w.secret, body);
-    const { httpStatus, responseBody } = await postWithTimeout(w.url, body, signature);
+    const { httpStatus, responseBody } = await postWithTimeout(urlCheck.url, body, signature, urlCheck.headers);
     const success = httpStatus >= 200 && httpStatus < 300;
 
     if (success) {
