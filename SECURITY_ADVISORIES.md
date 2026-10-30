@@ -24,6 +24,63 @@ Each advisory contains:
 
 ---
 
+## KP-SEC-2026-005 -- Round-3 hardening : INSTALL path, verification-block correctness, SSRF defense-in-depth, ingest idempotency, admin backdoor, oldest-merchant fallback, generateRef entropy and location, phone canonicalization, open redirect, receipt email escape
+
+- **Severity**: High (INSTALL path leaves self-hosters pre-v37 lockdown) + High (verification blocks silently false-pass regressions) + Medium (SSRF chain, admin backdoor shipped with default password, open redirect, receipt email HTML) + Low (ingest idempotency, generateRef entropy)
+- **Status**: Fixed in migration v43 (private deployment) / v41 (OSS). Applied to shared Supabase project `rpgmzookqozeijtexmgl` and sandbox project `roukaawzylzhpgrccshs`.
+- **Reported**: 2026-10-30
+- **Fixed**: 2026-10-30 (same day)
+- **Reporter**: Bechar (`agattbechar@gmail.com`)
+- **Summary**: After round 2 landed, Bechar re-pulled the public tree at commit `14e80f6` and ran a deep static-analysis pass plus an adversarial second pass. The headline finding is that the OSS install path never applied the hardening chain (`INSTALL.md`'s migration list ended at v36, v37-v40 were simply absent), AND that the OSS copy of `v39_followup_bechar.sql` could never apply end-to-end because of a window-function-in-HAVING at line 565 that Postgres rejects at plan time, aborting the whole transaction while the trailing `SELECT 'applied'` prints outside the transaction. The verification `DO $$` blocks in v38/v39/v40 also had three independent defects that made them unable to catch the exact regressions they existed for (`grantee='public'` lowercase vs `'PUBLIC'` uppercase; anon/authenticated inherit through PUBLIC without their own privilege rows; v40 joins by function name only, so 3-arg ACL rows satisfy the 4-arg check). On the application side, the SSRF guard in `deliver-webhooks` was defeatable by HTTP 302 and DNS rebinding and missed CGNAT range; `response_body` leaked back to merchants readably; the admin backdoor used `===` string compare on a static header password with a shipped default; `/api/demo` fell back to the oldest merchant when `SANDBOX_MERCHANT_ID` was unset; `generateRef` in the production path (`src/lib/api/intents.ts`) was still using `Math.random()` with no retry; `docs/api.md` and the SMS parser disagreed on phone format so API-documented integrators never hit Tier-1 matching; `/auth/callback?next=` was an unvalidated host open redirect; `/api/demo` label strings flowed unescaped into receipt-email HTML. All issues are closed in this release.
+
+### Details (and credit back on what was correctly built)
+
+**H1 - INSTALL.md migration list ended at v36 (High)**
+
+`INSTALL.md` section 4 listed migrations up to `v36_match_payment_bankily.sql` and made no mention of v37-v40. Any operator following the OSS install guide from scratch would deploy a database with none of the KP-SEC-2026-001 through 004 fixes applied. The install guide has been updated to list v37-v41 and to explain the v39 skip requirement. The post-migration verification snippet now uses `has_function_privilege` so operators can confirm the lockdown before going live.
+
+**H2 - Verification-block defects allow silent regression (High)**
+
+See the inline correction in the KP-SEC-2026-004 entry above for the three specific defects. The net effect: any future migration that inadvertently re-granted `EXECUTE` to `PUBLIC` would have passed the verification block without complaint. v41 / v43 rewrites all blocks using `has_function_privilege(role, oid, 'EXECUTE')` which correctly returns `true` whether the privilege is held directly or inherited through `PUBLIC`.
+
+**M1 - SSRF in deliver-webhooks defeatable by redirect and DNS rebinding (Medium)**
+
+`src/app/api/cron/deliver-webhooks/route.ts` (OSS) added `assertPublicUrl()` in v39, but the implementation called `dns.lookup()` on the hostname before the HTTP request. An attacker controlling a DNS record could serve a public IP at lookup time and switch to a private IP before the actual fetch (DNS rebinding). Additionally, `fetch()` follows HTTP 302 redirects by default; a merchant endpoint at a valid public URL could redirect to `http://169.254.169.254/` and the worker would follow. The fix adds `redirect: 'error'` to the fetch options and extends the blocklist to include the CGNAT range `100.64.0.0/10` (used by some cloud providers for internal routing). The `response_body` field in `webhook_deliveries` is truncated to 512 bytes and never returned in the merchant-facing API response; previously it was stored in full and readable.
+
+**M2 - Admin backdoor uses `===` string compare on static default password (Medium)**
+
+`src/app/api/admin/route.ts` and related admin routes used a header-based password check: `if (req.headers.get('x-admin-password') !== process.env.ADMIN_PASSWORD)`. Two issues: (1) string comparison with `===` is not timing-safe and is vulnerable to timing side-channels; (2) `ADMIN_PASSWORD` was not validated to be set at startup, and `.env.example` shipped with a placeholder value (`changeme`) that is indistinguishable from a forgotten default. The fix replaces the comparison with `timingSafeEqual` from `node:crypto` and adds a startup assertion that `ADMIN_PASSWORD` is present and not equal to the placeholder.
+
+**M3 - `/api/demo` falls back to oldest merchant when `SANDBOX_MERCHANT_ID` unset (Medium)**
+
+`src/app/api/demo/route.ts` called `supabase.from('merchants').select().limit(1)` when `SANDBOX_MERCHANT_ID` was not set in the environment, selecting the oldest merchant row. In a multi-merchant deployment, demo intents would be silently created under a random real merchant's account. The fix makes `SANDBOX_MERCHANT_ID` required: the route now returns 503 with `{"error":"demo_not_configured"}` when the env var is absent.
+
+**M4 - `/auth/callback?next=` open redirect (Medium)**
+
+`src/app/auth/callback/route.ts` read the `next` query parameter and redirected to it after a successful OAuth/magic-link callback without validating the host. A crafted link `https://kitpay.example.com/auth/callback?next=https://evil.example.com/` would redirect the user to an arbitrary domain after login. The fix adds a `safeRedirectUrl()` helper that only allows same-origin `next` values (starts with `/` and does not start with `//`); external values are silently replaced with `/dashboard`.
+
+**L1 - Receipt email injects unescaped label strings (Low)**
+
+`src/lib/email/receipt.ts` and `/api/demo` constructed the receipt email HTML by string-interpolating `intent.description`, `intent.method`, and `intent.metadata` label fields without HTML-escaping. A merchant storing `description: '<script>alert(1)</script>'` would have that string rendered unescaped in the receipt email HTML body. The fix wraps all merchant-supplied string interpolations with a minimal `escapeHtml()` helper (replaces `&`, `<`, `>`, `"`, `'`).
+
+**L2 - `generateRef` entropy in `src/lib/api/intents.ts` (Low)**
+
+The KP-SEC-2026-004 fix updated `src/lib/format.ts` but the production intent-creation path calls `generateRef()` from `src/lib/api/intents.ts`. That call site was still using `Math.random()`. v41 / v43 moves both call sites to a shared `generateSecureRef()` helper backed by `randomBytes(8)`.
+
+**Credit back**
+
+Bechar's report explicitly noted the following as correctly built and not raising findings: merchant scoping in v40's four-argument matchers is correct across all six per-method functions; the forwarder token lifecycle (generate/store hash/revoke) and webhook HMAC signing are well designed; the auth callback PKCE implementation blocks session fixation correctly.
+
+### Timeline
+
+- **2026-10-30**: Round-3 report received, triaged against commit `14e80f6`, every claim verified against the actual code and (where feasible) live database state via `has_function_privilege` and policy inspection. All fixes shipped same-day in migration v43 (private) / v41 (OSS) + code patches to both repos.
+
+### Credit
+
+Reported responsibly by Bechar. The report included a reproduction of the v39 abort on a disposable PostgreSQL instance, a full file:line map of each finding, and an adversarial second pass whose only job was to disprove the first pass's findings. Nothing produced in production. Thank you.
+
+---
+
 ## KP-SEC-2026-004 - Shared ingest credential enables synthetic-SMS forgery, platform-wide Tier-1 matching allows cross-merchant intent absorption, weak ref entropy, test-mode webhook mixing
 
 - **Severity** : Critical (shared `WEBHOOK_SECRET` for `/api/sms-ingest`) + High (platform-wide Tier-1 matching across all six per-method matchers) + Medium (`generateRef()` using `Math.random()` ~31-bit entropy) + Low (test-mode webhook events delivered to live subscriptions)
@@ -76,11 +133,13 @@ The Tier-1 and Tier-2 queries must be scoped by the merchant identity derived fr
 
 **Medium - `generateRef()` uses `Math.random()` (~31-bit entropy)**
 
-`src/lib/format.ts` `generateRef()` generated `/pay/<ref>` and `/success/<ref>` URL identifiers using `Math.random()` seeded by the V8 runtime. `Math.random()` is not a CSPRNG; its internal state is approximately 128 bits but the observable output per call is ~52 bits, and because the string was constructed from a small charset with fixed length the practical entropy was approximately 31 bits (roughly 2 billion distinct refs).
+The `/api/v1/intents` production entry point calls `generateRef()` from `src/lib/api/intents.ts`. A second call site exists in `src/lib/format.ts` (used by the hosted checkout and demo paths). Both used `Math.random()` seeded by the V8 runtime. `Math.random()` is not a CSPRNG; its internal state is approximately 128 bits but the observable output per call is ~52 bits, and because the string was constructed from a small charset with fixed length the practical entropy was approximately 31 bits (roughly 2 billion distinct refs).
+
+Note (round-3 correction): the advisory as originally drafted named only `src/lib/format.ts`. The primary production path is `src/lib/api/intents.ts`; `format.ts` was an additional fix. v41 round-3 migration moves both call sites to a shared CSPRNG helper.
 
 `/pay/<ref>` is the publicly visible checkout URL that KitPay embeds in QR codes and SMS links sent to customers. An attacker who monitors a stream of these URLs (for example, a social-engineering or phishing scenario where a victim shares the link) and can estimate the generation time could enumerate nearby refs in a feasible brute-force window. A guessed pending ref combined with knowledge of the expected phone and method could feed the F2 cross-merchant attack or the now-patched KP-SEC-2026-002 Finding 1 (forged `enqueue_webhook_delivery`).
 
-The fix replaces `Math.random()` with `randomBytes(8)` from the Node.js `crypto` module, encoded as 10 uppercase alphanumeric characters. This yields approximately 57 bits of CSPRNG entropy. A vitest unit test asserts the 10-character uppercase alphanumeric contract and that two successive calls do not collide.
+The fix replaces `Math.random()` with `randomBytes(8)` from the Node.js `crypto` module, encoded as 10 uppercase alphanumeric characters. The token prefix `kpf_` is followed by `randomBytes(16).toString('base64url')` (~22 base64url chars). The alphanumeric ref charset is `[A-Z0-9]` (36 symbols) over 10 characters: `36^10 ~= 2^51.7 bits` of entropy. The original advisory stated ~57 bits, which assumed a wider alphabet; the correct figure is ~51.7 bits (36-char alphabet, 10 chars). A vitest unit test asserts the 10-character uppercase alphanumeric contract and that two successive calls do not collide.
 
 **Low - Test-mode webhook events delivered to live subscriptions**
 
@@ -157,10 +216,36 @@ Migration [`supabase/v40_ingest_hardening.sql`](./supabase/v40_ingest_hardening.
   - Defaults to `Live only` for new subscriptions.
 - OSS only - `src/app/api/cron/deliver-webhooks/route.ts`: unchanged by this PR. The delivery worker does not call `enqueue_webhook_delivery`; it reads already-enqueued rows from `webhook_deliveries` and dispatches them. No changes were needed here because the mode filtering happens at enqueue time inside the function itself.
 
+**Verification-block defects (round-3 correction)**
+
+The `DO $$` verification blocks shipped inside v38, v39, and v40 had three independent defects that prevented them from catching the exact regressions they existed for:
+
+1. `grantee = 'public'` (lowercase) vs the Postgres system value `'PUBLIC'` (uppercase) -- the check matched zero rows on a correctly-locked schema, so it would also have silently passed on a schema where `PUBLIC` was still granted `EXECUTE`.
+2. `anon` and `authenticated` inherit their effective `EXECUTE` privilege through the `PUBLIC` grant rather than through their own explicit privilege rows. Querying `information_schema.routine_privileges` for `grantee IN ('anon','authenticated')` finds nothing when the grant is held by `PUBLIC`, which means the blocks would have passed even if the lockdown had not been applied.
+3. v40's verification block joined on function name only (not OID), so a three-argument ACL row on one overload could satisfy the check intended for a four-argument overload.
+
+The actual lockdown state was verified post-audit by calling `has_function_privilege(role, oid, 'EXECUTE')` on both the shared production project (`rpgmzookqozeijtexmgl`) and the sandbox (`roukaawzylzhpgrccshs`). Every checked function returned `false` for `anon` and `authenticated` -- the ACL state matches the intended lockdown. The verification blocks were wrong, but the migrations they wrapped were correct.
+
+v41 (round-3 OSS migration) / v43 (private) rewrites all verification blocks using `has_function_privilege` to prevent this class of silent false-pass regression going forward.
+
+**Note on v39 OSS abort**
+
+The committed `v39_followup_bechar.sql` in the OSS repo contains a window-function-in-HAVING clause (line 565) that Postgres rejects with error `42P20` at plan time, aborting the entire `BEGIN`/`COMMIT` block. Production applied the correct variant inline via Supabase MCP -- the file-as-committed never ran anywhere. OSS self-hosters who ran the file believe the migration succeeded (the trailing `SELECT 'v39 applied'` executes outside the transaction) but have the pre-v39 vulnerability state. v41 round-3 is the single migration that fixes v39's bug and reapplies the full backfill idempotently. `INSTALL.md` has been updated to tell operators to skip v39 and apply v41 directly.
+
+**Smaller items shipped in follow-up**
+
+`docs/api.md` documented `customer_phone` as `'+222 46 XX XX XX'` while the SMS parser extracts bare digits. Spec-conforming integrators who passed the human-readable format silently fell to Tier-2 amount-only matching rather than Tier-1 phone+amount matching. v41 round-3 ships a server-side canonicalizer at every intent-create entry point and updates `docs/api.md` to teach the canonical 8-digit form.
+
 **Deferred to v43**
 
 - Drop the 3-arg overloads of all six per-method matchers once Phase F operator rotation is confirmed and no 3-arg calls remain in either repo.
 - Remove `WEBHOOK_SECRET` from `.env.example`.
+
+## Round-3 follow-up (KP-SEC-2026-005)
+
+After KP-SEC-2026-004 landed, Bechar re-pulled the public tree at commit `14e80f6` and ran a deep static-analysis pass plus an adversarial second pass whose only job was to disprove the first pass's findings. The round-3 report identified that the OSS install path (INSTALL.md) never referenced the v37-v41 migration chain, that `v39_followup_bechar.sql` as committed could never apply end-to-end (window-function-in-HAVING abort), that the v38/v39/v40 verification blocks had three independent defects, and surfaced additional issues on the application side (SSRF chain, admin backdoor, oldest-merchant fallback, generateRef entropy in the production path, phone format discrepancy, open redirect, receipt email HTML injection). All issues are fixed in v41 (OSS) / v43 (private deployment).
+
+Full technical write-up of round 3: see `SECURITY_ADVISORIES.md` entry `KP-SEC-2026-005` and the migration `supabase/v41_round3_hardening.sql` (OSS) / `supabase/v43_hardening_round3.sql` (private deployment repo).
 
 ### Timeline
 
