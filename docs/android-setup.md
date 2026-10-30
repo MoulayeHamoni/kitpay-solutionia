@@ -11,8 +11,14 @@ et recommandees :
 
 Dans les deux cas, l'objectif est identique : declencher un
 `POST https://<votre-domaine>/api/sms-ingest` a chaque SMS pertinent,
-avec le header `x-webhook-secret` valide et un body JSON qui contient
-`from` et `sms_body`.
+avec le header `Authorization: Bearer kpf_<token>` valide et un body
+JSON qui contient `from` et `sms_body`.
+
+Le token est genere une seule fois dans `Dashboard -> Forwarders ->
+Nouveau forwarder`. Copiez-le immediatement : il n'est affiche qu'une
+fois. L'ancienne variable d'environnement `WEBHOOK_SECRET` est retiree
+depuis KP-SEC-2026-004 (fin octobre 2026) ; si votre `.env` la contient
+encore, elle peut etre supprimee.
 
 ## Prerequis physiques
 
@@ -39,10 +45,15 @@ avec le header `x-webhook-secret` valide et un body JSON qui contient
 Sender (filter)     : Bankily
 URL                 : https://<votre-domaine>/api/sms-ingest
 HTTP method         : POST
-Headers             : x-webhook-secret: <VOTRE WEBHOOK_SECRET>
+Headers             : Authorization: Bearer kpf_<copier depuis dashboard>
                       Content-Type: application/json
 Body                : {"from": "%from%", "sms_body": "%text%"}
 ```
+
+Le token `kpf_*` s'obtient dans `Dashboard -> Forwarders -> Nouveau
+forwarder`. Chaque telephone peut avoir son propre token (revocable
+individuellement). Le token commence par `kpf_` et fait environ 26
+caracteres en tout.
 
 Repeter pour chaque operateur en changeant le filtre expediteur :
 
@@ -92,13 +103,19 @@ Trigger : SMS Received -> Sender contains "<operateur>"
 Action  : HTTP Request
           Method  : POST
           URL     : https://<votre-domaine>/api/sms-ingest
-          Headers : x-webhook-secret: <VOTRE WEBHOOK_SECRET>
+          Headers : Authorization: Bearer kpf_<copier depuis dashboard>
                     Content-Type: application/json
           Body    : {"from": "<operateur>", "sms_body": "[sms_message]"}
 ```
 
 Adapter le trigger, l'operateur et le body pour chaque operateur, en
 suivant le tableau ci-dessus.
+
+Le token `kpf_*` s'obtient dans `Dashboard -> Forwarders -> Nouveau
+forwarder`. Si vous avez configure ce guide avant octobre 2026, le
+header `x-webhook-secret` n'est plus accepte depuis KP-SEC-2026-004 :
+vous devez remplacer le header par `Authorization: Bearer kpf_<nouveau
+token>` dans chaque macro MacroDroid.
 
 ## Verifier que ca marche
 
@@ -127,11 +144,16 @@ Une fois configure :
 
 ### Le SMS est envoye mais le serveur repond 401
 
-`WEBHOOK_SECRET` ne matche pas. Verifier :
-- La valeur dans le header envoye par le forwarder.
-- La valeur dans `.env.local` puis dans les env vars Netlify/Vercel de
-  production.
-- Redeployer si vous avez change `WEBHOOK_SECRET` en prod.
+Le token Bearer n'est pas reconnu. Verifier :
+- Le header `Authorization` est bien present, prefixe par `Bearer `
+  (avec un espace apres `Bearer`).
+- Le token commence par `kpf_` et fait environ 26 caracteres.
+- Le device n'est pas revoque : `Dashboard -> Forwarders -> Dernier SMS`
+  doit se mettre a jour sur chaque POST reussi.
+- Si vous suivez une ancienne version de ce guide : le header
+  `x-webhook-secret` n'est plus accepte depuis KP-SEC-2026-004 (fin
+  octobre 2026). Creez un nouveau forwarder dans le dashboard et
+  copiez le nouveau token.
 
 ### Le SMS est parse mais le status ne change pas
 
@@ -158,3 +180,10 @@ veille. Solutions :
 - Installer une app "keep alive" comme Wakey.
 - Configurer un monitoring qui redemarre le telephone a distance (par
   exemple via Tasker + IFTTT) si le forwarder est mort.
+
+### En cas de 401 recurrent
+
+- Verifiez le header `Authorization` est bien present, prefixe par `Bearer ` (un seul espace entre).
+- Verifiez le token commence par `kpf_` et fait ~26 caracteres.
+- Verifiez que le device n'est pas revoque : dashboard -> Forwarders -> `Dernier SMS` doit se mettre a jour sur chaque POST reussi.
+- Si vous suivez une ancienne version de ce guide : le header `x-webhook-secret` n'est plus accepte depuis KP-SEC-2026-004 (fin octobre 2026). Regenerez un token forwarder.
